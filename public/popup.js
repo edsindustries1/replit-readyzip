@@ -44,8 +44,8 @@
             '    <img id="ctaLogo" src="' + config.logoUrl + '" alt="' + config.logoAlt + '">',
             '    <span id="ctaLogoText">' + (config.logoText || config.service) + '</span>',
             '  </div>',
-            '  <div id="ctaHeadline">Having trouble with ' + config.service + '?</div>',
-            '  <div id="ctaSub">Our independent support team is ready to help you right now — no waiting, no hold music.</div>',
+            '  <div id="ctaHeadline">' + config.service + ' Not Working?</div>',
+            '  <div id="ctaSub">Our team is ready to help you right now &mdash; no waiting, no hold music.</div>',
             '  <a id="ctaCallBtn" href="tel:' + config.phoneTel + '">',
             '    <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">',
             '      <path d="M6.62 10.79c1.44 2.83 3.76 5.14 6.59 6.59l2.2-2.2c.27-.27.67-.36 1.02-.24',
@@ -54,10 +54,10 @@
             '    </svg>',
             '    Call ' + config.phone,
             '  </a>',
-            '  <div id="ctaAvail">Available 24/7 &mdash; Independent support</div>',
+            '  <div id="ctaAvail">Available 24/7 &mdash; Real People, Real Help</div>',
             '  <a id="ctaDismiss" role="button" tabindex="0">Continue browsing &rarr;</a>',
             '  <div id="ctaDisclaimer">',
-            '    Independent support service. Not affiliated with or endorsed by ' + config.service + '.',
+            '    Third-party support service. Not the official ' + config.service + ' support.',
             '  </div>',
             '</div>'
         ].join('\n');
