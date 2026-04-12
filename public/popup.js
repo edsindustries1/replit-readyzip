@@ -90,7 +90,20 @@
             document.body.style.overflow = '';
         }
 
+        /* ── Google Ads conversion — fires when call button is clicked ── */
+        function fireConversion() {
+            if (typeof gtag === 'function') {
+                gtag('event', 'conversion', {
+                    'send_to': 'AW-11546748562/0VO9CImIrfsbEJLN9YEr',
+                    'value': 1.0,
+                    'currency': 'INR'
+                });
+            }
+        }
+
         /* ── Event listeners ── */
+        document.getElementById('ctaCallBtn').addEventListener('click', fireConversion);
+
         document.getElementById('ctaClose').addEventListener('click', closePopup);
 
         document.getElementById('ctaDismiss').addEventListener('click', closePopup);
