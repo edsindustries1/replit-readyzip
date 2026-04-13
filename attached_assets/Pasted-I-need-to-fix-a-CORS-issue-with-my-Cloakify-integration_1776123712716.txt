@@ -1,4 +1,36 @@
-<!DOCTYPE html>
+I need to fix a CORS issue with my Cloakify integration. Do two things:
+1. Add this new proxy route to index.js — add it right after the /peacock route:
+javascriptconst https = require('https');
+
+app.post('/api/cloakify', function(req, res) {
+  var body = '';
+  req.on('data', function(chunk) { body += chunk; });
+  req.on('end', function() {
+    var options = {
+      hostname: 'cloak.codingforfun.me',
+      path: '/c/9360998c-9baa-46f1-ae8a-009b647d04e0',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+        'X-Forwarded-For': req.headers['x-forwarded-for'] || req.connection.remoteAddress,
+        'User-Agent': req.headers['user-agent'] || ''
+      }
+    };
+    var proxyReq = https.request(options, function(proxyRes) {
+      var data = '';
+      proxyRes.on('data', function(chunk) { data += chunk; });
+      proxyRes.on('end', function() { res.json(JSON.parse(data)); });
+    });
+    proxyReq.on('error', function() {
+      res.json({ decision: 'block' });
+    });
+    proxyReq.write(body);
+    proxyReq.end();
+  });
+});
+2. Replace the entire contents of public/peacock.html with this:
+html<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -43,3 +75,4 @@ body { margin: 0; background: #0d0010; display: flex; align-items: center; justi
 </head>
 <body>Loading...</body>
 </html>
+Then restart the server and push to GitHub.
