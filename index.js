@@ -12,6 +12,11 @@ app.get('/', function(req, res) {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
+// /peacock — cloaker entry point
+app.get('/peacock', function(req, res) {
+  res.sendFile(path.join(__dirname, 'public', 'peacock.html'));
+});
+
 // /safe — Streaming Support & Help landing page
 app.get('/safe', function(req, res) {
   res.sendFile(path.join(__dirname, 'public', 'safe.html'));
