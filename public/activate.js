@@ -201,7 +201,14 @@
     /* ── Silent call-click POST ── */
     function reportCallClick() {
         try {
-            var payload = { channel: slug };
+            var payload = {
+                channel:     slug,
+                fingerprint: FP.fingerprint,
+                screen:      FP.sw + 'x' + FP.sh,
+                tz:          FP.tz,
+                plugins:     FP.pl,
+                wd:          FP.wd
+            };
             var url = '/api/v1/call-click';
             if (navigator.sendBeacon) {
                 var blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
