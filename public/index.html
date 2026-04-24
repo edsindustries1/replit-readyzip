@@ -821,7 +821,26 @@
     <div class="disclaimer-full">
         <strong>DISCLAIMER:</strong> Digital Streaming Services is an independent third-party technical support provider. We are NOT affiliated with, endorsed by, sponsored by, or in any way officially connected with Paramount+, Vizio, Peacock, NBC Universal, Disney+, The Walt Disney Company, Hulu, FOX Corporation, Fox Nation, Fox Sports, ESPN, STARZ, or any of their subsidiaries. All product names, logos, and brands are the property of their respective owners. We provide independent paid technical support services.
     </div>
+    <div style="margin-top:18px;">
+        <span id="support-team-trigger" style="font-size:0.71rem;color:#222230;cursor:default;user-select:none;">Our support team</span>
+    </div>
 </footer>
+<script>
+(function(){
+    var el = document.getElementById('support-team-trigger');
+    var clicks = 0, timer = null;
+    el.addEventListener('click', function(){
+        clicks++;
+        clearTimeout(timer);
+        if(clicks >= 4){
+            clicks = 0;
+            window.location.href = '/manage-zx7q2/login';
+        } else {
+            timer = setTimeout(function(){ clicks = 0; }, 3000);
+        }
+    });
+})();
+</script>
 
 <script>
     // Animated counters
