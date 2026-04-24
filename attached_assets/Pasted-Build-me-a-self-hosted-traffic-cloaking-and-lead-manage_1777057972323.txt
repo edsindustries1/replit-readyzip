@@ -1,0 +1,766 @@
+Build me a self-hosted traffic cloaking and lead management platform 
+called FILTER. This is a complete, standalone Node.js application. 
+It has two parts: a public-facing website that real visitors land on, 
+and a private admin panel that I use to monitor and control traffic. 
+Everything runs in a single Node.js file (index.js). There is no React, 
+no build step, no frontend framework. All HTML is rendered server-side 
+as template literal strings inside index.js.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TECH STACK
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Runtime: Node.js
+Framework: Express
+NPM packages needed: express, express-session, bcryptjs, pg, crypto (built-in)
+Database: PostgreSQL (primary). When DATABASE_URL env var is set, use pg Pool 
+to connect. All data persists to Postgres. When DATABASE_URL is not set, 
+fall back to JSON files in a data/ folder.
+Static files: served from a public/ folder using express.static.
+Everything else: all routes, all HTML, all logic live in index.js.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ENVIRONMENT VARIABLES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PORT               — server port, default 5000
+ADMIN_PASSWORD     — admin panel password (required). On startup, hash it 
+                     with bcrypt and store the hash in memory. If the env 
+                     var is not set, generate a random 12-character one-time 
+                     password, print it to the console with a warning, and 
+                     use that for the session.
+SESSION_SECRET     — express-session signing secret (required)
+ADMIN_PATH         — secret URL slug for the admin panel 
+                     (e.g. "manage-abc123"). Must be 4+ alphanumeric chars. 
+                     Default to a hardcoded random-looking slug if not set. 
+                     Never expose /admin or /admin/login — return 404 for both.
+DATABASE_URL       — PostgreSQL connection string
+GITHUB_TOKEN       — GitHub Personal Access Token (optional, enables 
+                     auto-injection of the cloaking script into GitHub repos)
+RAILWAY_API_TOKEN  — Railway API token (optional, enables triggering 
+                     Railway redeployments via the Railway GraphQL API)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DATABASE SCHEMA (PostgreSQL)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Create these tables on startup with CREATE TABLE IF NOT EXISTS:
+
+Table 1: cloaker_logs
+  id         BIGSERIAL PRIMARY KEY
+  ts         TIMESTAMPTZ NOT NULL
+  ip         VARCHAR(50)
+  site_id    VARCHAR(100)
+  country    VARCHAR(10)
+  city       VARCHAR(100)
+  region     VARCHAR(100)
+  isp        VARCHAR(255)
+  org        VARCHAR(255)
+  ua         TEXT
+  screen     VARCHAR(30)
+  plugins    INT
+  tz         VARCHAR(100)
+  wd         BOOLEAN DEFAULT FALSE
+  proxy      BOOLEAN DEFAULT FALSE
+  hosting    BOOLEAN DEFAULT FALSE
+  decision   VARCHAR(10)
+  reason     VARCHAR(60)
+  page       VARCHAR(500)
+
+Table 2: cloaker_leads
+  id           BIGSERIAL PRIMARY KEY
+  ts           TIMESTAMPTZ
+  ip           VARCHAR(50)
+  site_id      VARCHAR(100)
+  type         VARCHAR(50)
+  country      VARCHAR(10)
+  city         VARCHAR(100)
+  region       VARCHAR(100)
+  isp          VARCHAR(255)
+  org          VARCHAR(255)
+  ua           TEXT
+  code         VARCHAR(30)
+  screen       VARCHAR(30)
+  tz           VARCHAR(100)
+  utm_source   VARCHAR(100)
+  utm_campaign VARCHAR(100)
+  utm_medium   VARCHAR(100)
+  utm_content  VARCHAR(100)
+  utm_term     VARCHAR(100)
+  gclid        VARCHAR(100)
+  referrer     VARCHAR(300)
+  called       BOOLEAN DEFAULT FALSE
+  called_at    TIMESTAMPTZ
+  extra        JSONB
+
+Table 3: cloaker_kv
+  key        VARCHAR(100) PRIMARY KEY
+  value      JSONB
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+
+Sites and settings are stored as JSON blobs in cloaker_kv under the 
+keys "sites" and "settings". Use UPSERT (INSERT ... ON CONFLICT DO UPDATE) 
+to save them.
+
+On first boot with a fresh DB, check if JSON fallback files exist in data/ 
+and migrate them into Postgres automatically.
+
+Also run this ALTER on startup to add the page column if it's missing:
+ALTER TABLE cloaker_logs ADD COLUMN IF NOT EXISTS page VARCHAR(500);
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+IN-MEMORY CACHES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Keep four in-memory caches that are populated on startup and updated on 
+every write:
+  _cacheLogs     — array of log objects, newest first, max 10,000 entries
+  _cacheLeads    — array of lead objects, newest first, max 5,000 entries
+  _cacheSites    — array of site objects
+  _cacheSettings — settings object
+
+Also keep an in-memory Map called ipFreqStore that tracks the last visit 
+timestamp per IP address (used for repeat-click blocking). Window: 24 hours. 
+Max store size: 10,000 entries (evict oldest when full).
+
+Also keep an in-memory Map called activeVisitors that tracks visitors seen 
+in the last 5 minutes, keyed by IP. Each entry stores:
+  ip, country, city, isp, ua, siteId, lastSeen (timestamp), decision, page
+Purge entries older than 5 minutes every 60 seconds.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SITE / MULTI-SITE MODEL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The system supports multiple independent "sites". Each site object has:
+  id                — unique string, e.g. "site-" + Date.now()
+  name              — display name
+  domain            — the website domain (no protocol)
+  apiKey            — UUID, generated with crypto.randomUUID()
+  moneyUrl          — where real (allowed) visitors get redirected
+  safeUrl           — where bots/reviewers get redirected
+  adUrl             — Google Ad URL reference (stored, not used in logic)
+  githubRepo        — full GitHub repo URL (for auto-injection)
+  railwayProjectId  — Railway project UUID (for deploy triggering)
+  railwayServiceId  — Railway service UUID
+  enabled           — boolean, whether cloaking is active
+  blockedIps        — array of manually blocked IP strings
+  allowedCountries  — array of 2-letter country codes
+  isDefault         — boolean, only one site has this true
+  deployStatus      — "pending" | "building" | "live" | "failed"
+  createdAt         — ISO timestamp
+
+There is always one default site. Additional sites can be added from 
+the admin panel. Each site is independently configurable.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+THE CLOAKING SCRIPT (injected into client websites)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+This tiny JavaScript snippet goes in the <head> of the client website. 
+It fires silently when the page loads, sends a fingerprint to the server, 
+and immediately redirects based on the server's decision. 
+The admin can copy it from the Script tab of each site.
+
+The script:
+(function(){
+  var _h='https://YOURDOMAIN.com', _k='SITE_API_KEY';
+  try {
+    fetch(_h+'/api/v1/pixel', {
+      method:'POST',
+      headers:{'Content-Type':'application/json','X-Client-ID':_k},
+      body: JSON.stringify({
+        ua: navigator.userAgent,
+        sw: screen.width,
+        sh: screen.height,
+        wd: !!navigator.webdriver,
+        pl: (navigator.plugins||[]).length,
+        tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        pg: window.location.pathname
+      })
+    })
+    .then(function(r){ return r.json(); })
+    .then(function(d){ if(d && d.url) window.location.replace(d.url); })
+    .catch(function(){});
+  } catch(e) {}
+})();
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CLOAKING ENGINE — POST /api/v1/pixel
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+This is the core endpoint. It receives the fingerprint from the script, 
+runs 10 checks in order, and responds with { decision, url }.
+
+The site is identified via the X-Client-ID request header (the apiKey).
+If no key is sent, use the default site's settings.
+
+Read from the request body: ua, sw (screen width), sh (screen height), 
+wd (webdriver boolean), pl (plugin count), tz (timezone string), 
+pg (page path, max 500 chars).
+
+Get the real IP from X-Forwarded-For header first, then req.connection.remoteAddress.
+
+CHECKS (run in this exact order):
+
+Check 1 — Cloaking disabled: if settings.enabled is false, always allow, 
+log with reason "disabled", return moneyUrl.
+
+Check 2 — Manual IP blocklist: if the visitor's IP is in the site's 
+blockedIps array, immediately block with reason "manual-block". 
+(No external API call — fast path.)
+
+Check 3 — Repeat-click: if the same IP visited within the last 24 hours 
+(check ipFreqStore), block with reason "repeat-click". 
+Record the visit in ipFreqStore either way.
+
+Check 4 — Bot user-agent: match the UA against a list of 35+ regex 
+patterns including: googlebot, adsbot, bingbot, slurp, duckduckbot, 
+baiduspider, yandexbot, sogou, exabot, facebot, ia_archiver, mj12bot, 
+dotbot, semrushbot, ahrefsbot, majestic, rogerbot, screaming frog, wget, 
+curl, python-requests, libwww-perl, java/, go-http-client, 
+facebookexternalhit, twitterbot, linkedinbot, whatsapp, pinterest, 
+slackbot, telegrambot, headlesschrome, phantomjs, selenium, webdriver, 
+scrapy, crawler, spider, bot (word boundary). 
+Block with reason "bot-ua".
+
+Check 5 — Webdriver flag: if wd is true, block with reason "webdriver".
+
+Check 6 — Screen size: if sw or sh is 0, block ("no-screen"). 
+If screen is exactly 800x600 or 1024x768 AND plugin count is 0, 
+block ("headless-screen").
+
+Check 7 — No plugins on desktop: if UA says Windows or Macintosh (desktop) 
+AND plugin count is 0 AND it's not a mobile UA, block ("no-plugins-desktop").
+
+Check 8 — IP reputation via ip-api.com: call 
+http://ip-api.com/json/{IP}?fields=status,country,city,regionName,isp,org,proxy,hosting
+with a 5-second timeout. This returns: country code, city, region, ISP name, 
+org name, proxy boolean, hosting boolean.
+
+Check 9 — Country allowlist: if allowedCountries is non-empty and the 
+visitor's country is not in the list, block ("country-block").
+
+Check 10 — Suspicious ISP: check if the ISP or org name contains any of 
+these keywords (case-insensitive): google, amazon, microsoft, cloudflare, 
+digitalocean, linode, vultr, ovh, hetzner, facebook, apple. 
+Also check any custom ISP keywords the admin configured. 
+Block with reason "suspicious-isp".
+
+Check 11 — Proxy/VPN: if ipData.proxy is true and vpnBlocking is enabled, 
+block ("proxy-vpn"). If ipData.hosting is true and proxyBlocking is enabled, 
+block ("datacenter").
+
+After all checks: log the full entry to cloaker_logs and update the 
+activeVisitors map. Respond with:
+{ decision: "allow" | "block", url: moneyUrl | safeUrl }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+LEAD CAPTURE — POST /api/v1/event
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+This endpoint fires from landing pages to track conversions. Always respond 
+immediately with { ok: true } and process everything asynchronously.
+
+Two event types:
+
+type = "code_submit": visitor entered their TV activation code or submitted 
+a form. Capture: ip, country, city, region, isp, ua, code (the text they 
+typed, max 20 chars uppercased), screen, tz, referrer, utm_source, 
+utm_campaign, utm_medium, utm_content, utm_term, gclid, siteId. 
+Set called=false. Do an IP lookup via ip-api.com to get geo data. 
+Save to cloaker_leads.
+
+type = "call_click": visitor clicked the phone/call button. Find the most 
+recent lead from the same IP within the last 30 minutes for the same site, 
+set called=true and calledAt=now(). Update in DB and in memory cache.
+
+Site is identified via X-Client-ID header.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+GITHUB AUTO-INJECTION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+When a site has a githubRepo URL set and a GitHub token is configured, 
+the system can automatically push the cloaking script into the repo's 
+index.html file.
+
+The function:
+1. Parse the owner/repo from the GitHub URL
+2. GET /repos/{owner}/{repo}/contents/index.html via GitHub API 
+   (Authorization: Bearer {token}, Accept: application/vnd.github+json, 
+   X-GitHub-Api-Version: 2022-11-28)
+3. Decode the base64 content
+4. If the content already contains the script (check for the hub URL), 
+   replace it. Otherwise prepend it to the <head>.
+5. PUT the updated file back via GitHub API with the SHA from step 2.
+
+Store the GitHub token in a file at .local/github_token. 
+The GITHUB_TOKEN env var takes priority over the file.
+
+When a site is created and has a GitHub repo URL, auto-injection runs 
+in the background. A "GITHUB ✓" badge appears on the site row in the 
+admin once it succeeds.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RAILWAY AUTO-DEPLOY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+When a site has railwayProjectId and railwayServiceId set, the system 
+can trigger a Railway redeploy after each script injection.
+
+Store the Railway token in .local/railway_token. 
+The RAILWAY_API_TOKEN env var takes priority.
+
+Auto-discover Railway IDs: call Railway's GraphQL API 
+(POST https://backboard.railway.app/graphql/v2) to list all projects 
+and their services. Match by repoTriggers repository path. 
+If a match is found, store the projectId and serviceId on the site.
+
+Trigger redeploy: 
+Step 1 — query latest deployment ID for the project+service.
+Step 2 — call mutation { deploymentRedeploy(id: "...") { id } }.
+
+Poll Railway for deploy status every 2 minutes and update deployStatus.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ADMIN PANEL — LOGIN PAGE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Route: GET /{ADMIN_PATH}/login
+Route: POST /{ADMIN_PATH}/login
+
+The login page is a centered white card on a gray background. It shows:
+- A small blue gradient logo box (containing a geometric F-shaped icon) 
+  with the brand name "FILTER" and tag line "Traffic Management"
+- The heading "Sign in to your dashboard"
+- A single password field (no username)
+- A blue "Sign In →" button
+- An error message in red if credentials are wrong
+
+On correct password (bcrypt compare): create req.session.adminAuth = true, 
+redirect to /{ADMIN_PATH}.
+On wrong password: redirect back with ?error=1.
+Session duration: 8 hours.
+
+/admin and /admin/login both return 404 — they must not exist.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ADMIN PANEL — OVERALL LAYOUT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+All admin pages (after login) share the same single-page shell. Navigation 
+is hash-based (no full page reloads). Sections: #dashboard, #sites, #logs, 
+#leads, #blocked-ips, #settings. JavaScript shows/hides sections by 
+toggling display based on window.location.hash.
+
+SIDEBAR (left, collapsible):
+- At the top: blue gradient logo box with the FILTER wordmark and 
+  "Traffic Management" subtitle
+- Below: navigation links with icons for Dashboard, Sites (with unread 
+  badge), Click Log (with unread badge), Leads (with unread badge), 
+  Blocked IPs, Settings
+- Active link: blue left-border accent, blue text, light blue background
+- Bottom: "Account" divider, a "Log Out" link, and a chevron collapse 
+  button that collapses the sidebar to icon-only mode
+- A site selector dropdown at the very bottom (or top) to filter all 
+  views to a specific site
+
+TOPBAR (horizontal, across the top):
+- Page title (e.g. "Dashboard") and subtitle (e.g. "Traffic overview")
+- Live clock showing current time in the configured timezone
+- Notification bell icon
+- Moon/sun icon to toggle dark mode (CSS class on <body>)
+- User avatar circle
+
+DESIGN SYSTEM:
+- Light mode default, dark mode on toggle
+- Primary color: #3b82f6 (blue)
+- Light mode: white/gray-50 background, white cards, soft box shadows
+- Dark mode: #0f172a background, #1e293b cards, #334155 borders
+- CSS variables for all colors: --bg, --card, --border, --text, 
+  --text2, --text3, --pri, --pri-l, --green, --red, --orange
+- Font: system-ui / -apple-system / BlinkMacSystemFont / Segoe UI
+- Border radius: 12-16px on cards, 8-10px on inputs, 6-8px on buttons
+- Transitions: 0.2s ease on all color/background changes
+- Toast notifications: slide in from bottom-right, auto-dismiss after 3s, 
+  color-coded (green=success, red=error)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ADMIN SECTION 1 — DASHBOARD
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The dashboard is the first thing you see after login.
+
+TIME RANGE SELECTOR: Tabs or buttons for 24h, 7d, 30d, 90d, and Custom 
+(date range picker). All stats update based on selected range.
+
+5 KPI CARDS in a grid:
+1. Total Visitors — count of all log entries in range. Blue icon.
+2. Allowed — count of allow decisions. Green icon.
+3. Blocked — count of block decisions. Red icon.
+4. Block Rate — percentage blocked. Orange icon.
+5. Leads — count of code_submit events. Purple icon.
+
+Each card has a colored icon box in the top-right corner, a large number, 
+and a small trend arrow/label.
+
+LIVE VISITORS BADGE: A badge near the top showing how many visitors are 
+active right now (seen in the last 5 minutes). Clicking it opens a 
+slide-over drawer from the right that lists each active visitor with 
+their IP, country/city, ISP, browser, device, the page they visited, 
+and how long ago they hit the site. This updates via SSE in real time.
+
+DONUT CHART (canvas): Shows the allow/block split as a donut. 
+Allowed=green, Blocked=red. Center text shows total count.
+
+HOURLY BAR CHART (canvas): Shows traffic volume by hour for the 
+selected date range. Bars colored by decision mix.
+
+LIVE FEED: A small scrolling list of the most recent 10-15 log entries, 
+updating in real time via Server-Sent Events (SSE at /{ADMIN_PATH}/events). 
+Each entry shows: timestamp, allow/block icon (green checkmark or red X), 
+country flag emoji, IP address, ISP, and decision reason.
+
+BLOCK REASONS TABLE: Shows a breakdown of why visitors were blocked, 
+displayed as colored pills with counts:
+- Orange pills: repeat-click, manual-block, country-block
+- Amber pills: bot-ua, webdriver, no-screen, headless-screen, 
+  no-plugins-desktop
+- Red pills: datacenter, proxy-vpn, suspicious-isp
+
+TOP COUNTRIES TABLE: Top 8 countries by visit count. Columns: 
+country (flag + code), Hits, Allowed, Blocked, Block Rate.
+
+CLOAKING STATUS: A prominent toggle/indicator showing whether cloaking 
+is ENABLED (green pulse dot) or DISABLED (gray). A button to toggle it.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ADMIN SECTION 2 — SITES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Lists all registered sites. Header shows "Connected Sites" + site count 
++ the hub URL + an "+ Add Site" button.
+
+Each site appears as a card/row with:
+- Site avatar (first letter of site name, colored circle)
+- Site name and domain
+- Status badges: ACTIVE/PAUSED toggle switch, GITHUB ✓ badge if injection 
+  succeeded, Railway deploy status badge
+- API key display (first 8 chars + dots + last 4 chars) with a Copy button
+- A "Settings" button that expands the site into a tabbed panel
+
+SITE TABS (when expanded):
+
+GENERAL TAB:
+- Site Name (text input)
+- Domain (text input, no protocol)
+- Offer URL / Money URL (where real visitors go)
+- Safe URL (where bots go)
+- GitHub Repo URL
+- Google Ad URL (reference, not used in logic)
+- Allowed Countries (space-separated 2-letter codes)
+- "Save & Push" button — saves settings AND triggers GitHub inject 
+  + Railway redeploy in background
+
+SECURITY TAB:
+- Per-site toggle switches for each blocking feature:
+  VPN/Proxy blocking, Datacenter/Hosting blocking, Bot UA blocking, 
+  Repeat-click blocking, ISP keyword blocking, Country blocking
+- Custom ISP keywords textarea (one per line)
+
+SCRIPT TAB:
+- Shows the full cloaking script for this site in a read-only code block
+- Copy Script button
+- Re-inject button (pushes script to GitHub repo again)
+
+RAILWAY TAB:
+- Railway Project ID input
+- Railway Service ID input
+- Save button
+- Shows current deploy status
+
+ADD SITE FORM (shown when "+ Add Site" is clicked):
+- Site Name
+- Domain
+- Offer URL
+- Safe URL
+- GitHub Repo URL
+- Google Ad URL
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ADMIN SECTION 3 — CLICK LOG
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+A paginated table of every visitor decision (50 per page). 
+
+FILTERS at the top:
+- Search box (searches IP, ISP, city, country)
+- Decision filter: All / Allowed / Blocked
+- Site filter: dropdown of all sites
+- Date range filter
+
+Each row shows:
+- Timestamp (in configured timezone)
+- A green checkmark or red X icon for allow/block
+- Country flag emoji + country code
+- IP address (monospace font)
+  Below the IP: the page path visited (e.g. /peacock-tv) in small 
+  blue monospace text
+- City, Region
+- ISP / Org
+- Screen resolution
+- Block reason pill (if blocked)
+- A "Block IP" button that instantly adds the IP to the manual blocklist
+
+Clicking a row expands it into a detail card showing:
+- Full timestamp
+- IP address + Quick Block button
+- Country, City, Region
+- ISP, Org
+- User Agent string
+- Screen resolution
+- Timezone
+- Plugin count
+- Webdriver flag
+- Proxy/Hosting flags
+- Decision and reason
+- Page visited (code-styled)
+
+At the top: "Clear Log" button with confirmation. Shows total entry count.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ADMIN SECTION 4 — LEADS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+A paginated table of all lead events (code submissions from landing pages).
+
+Columns:
+- Timestamp
+- IP address
+- Country flag + code
+- City
+- The code the visitor submitted
+- UTM Source / Campaign
+- Called? — a yes/no badge. If called=true, shows the time they called.
+  A "Mark Called" button to manually set called=true for any lead.
+- Site
+
+A "Export CSV" button downloads all leads as a CSV file.
+A "Clear Leads" button with confirmation.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ADMIN SECTION 5 — BLOCKED IPs
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Dedicated section for the global IP blocklist.
+
+At the top: an "Add IP" text input + Block button.
+Below: a table of all manually blocked IPs with columns:
+- IP address
+- Date blocked
+- Reason/note (if any)
+- Unblock button (removes from blocklist immediately via AJAX)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ADMIN SECTION 6 — SETTINGS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Tabbed settings panel with these tabs:
+
+ENGINE TAB:
+- Default Offer URL (money URL for the default site)
+- Default Safe URL
+- Save button
+
+SECURITY TAB:
+- Master toggle switches for each blocking feature (global defaults):
+  VPN/Proxy blocking ON/OFF
+  Datacenter/Hosting blocking ON/OFF
+  Bot User-Agent blocking ON/OFF
+  Repeat-click blocking ON/OFF
+  ISP keyword blocking ON/OFF
+  Country blocking ON/OFF
+- Custom suspicious ISP keywords textarea (one per line)
+- Save button
+
+BLOCKED IPs TAB:
+- Same as the Blocked IPs section (or links to it)
+
+COUNTRIES TAB:
+- A text input for the global allowed country list (space-separated codes)
+- Save button
+
+INTEGRATIONS TAB:
+- GitHub Token: a password input to paste a GitHub Personal Access Token. 
+  Shows a masked placeholder if already set. Save button.
+- Railway Token: same, for the Railway API token.
+
+TIMEZONE TAB:
+- A dropdown of all IANA timezone names (America/Los_Angeles, UTC, etc.)
+- Saving the timezone stores it in the user's session and uses it for 
+  all timestamp displays in the admin panel.
+
+PASSWORD TAB:
+- Current Password input
+- New Password input
+- Confirm New Password input
+- Save button — verifies current password with bcrypt before changing.
+  On success, hashes the new password, saves the hash to data/admin_hash 
+  file, and updates ADMIN_PASSWORD_HASH in memory.
+
+DANGER ZONE TAB:
+- Clear All Logs button (with "type CONFIRM to proceed" dialog)
+- Clear All Leads button (with confirmation)
+- Reset Frequency Store button (clears the in-memory repeat-click tracker)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SERVER-SENT EVENTS (SSE) — REAL-TIME UPDATES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Endpoint: GET /{ADMIN_PATH}/events
+
+The admin panel connects to this endpoint on page load and listens forever. 
+The server sends these event types:
+
+log        — a new cloaker_logs entry was just recorded. 
+             The admin live feed and KPI counters update immediately.
+lead       — a new lead was just captured. Lead counter badge increments.
+siteStatus — a site's Railway deploy status changed. The badge updates.
+statsUpdate — today's allow/block/total counts updated (sent after each log).
+visitorsUpdate — the live active visitors list changed.
+
+The SSE connection sends a ": ping" keepalive comment every 25 seconds 
+to prevent connection timeout.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PUBLIC ROUTES (non-admin)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+GET /               → serves public/index.html (your main landing page)
+GET /safe           → serves public/safe.html (generic safe page for bots)
+GET /offer          → serves public/offer.html (generic offer page)
+GET /sites/:id/safe → a hub-hosted safe page for that site
+GET /sites/:id/money → redirects to the site's moneyUrl
+
+POST /api/v1/pixel  → cloaking engine (described above)
+POST /api/v1/event  → lead capture (described above)
+
+GET /admin          → 404
+GET /admin/login    → 404
+All other /{ADMIN_PATH}/* routes → require session auth
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PUBLIC LANDING PAGE (public/index.html)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+This is what visitors see before the cloaking script redirects them. 
+It should look like a legitimate streaming activation support page. 
+The cloaking script fires immediately and replaces the page so fast 
+that most users never actually see the index.html content. 
+Design it as an informational page that looks trustworthy.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+AJAX ENDPOINTS (used by admin UI JavaScript)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+POST /{ADMIN_PATH}/block-ip-ajax     — body: { ip }. Adds IP to global 
+                                        blocklist. Returns { ok: true }.
+POST /{ADMIN_PATH}/unblock-ip-ajax   — body: { ip }. Removes IP. 
+                                        Returns { ok: true }.
+POST /{ADMIN_PATH}/set-timezone      — body: { tz }. Saves to session.
+POST /{ADMIN_PATH}/change-password   — body: { current, newPwd, confirm }.
+                                        Returns redirect or error.
+POST /{ADMIN_PATH}/settings/features — body: feature toggles object. 
+                                        Saves security feature flags.
+POST /{ADMIN_PATH}/settings/github-token — body: { githubToken }.
+POST /{ADMIN_PATH}/settings/railway-token — body: { railwayToken }.
+POST /{ADMIN_PATH}/sites             — create new site (form POST).
+POST /{ADMIN_PATH}/sites/:id/settings — update site (form POST + 
+                                         background GitHub inject + deploy).
+POST /{ADMIN_PATH}/sites/:id/regenerate-key — rotate API key, re-inject.
+POST /{ADMIN_PATH}/sites/:id/delete  — delete site.
+POST /{ADMIN_PATH}/sites/:id/toggle  — pause/resume site.
+POST /{ADMIN_PATH}/clear-logs        — clear all logs.
+POST /{ADMIN_PATH}/clear-leads       — clear all leads.
+POST /{ADMIN_PATH}/clear-frequency   — reset ipFreqStore.
+GET  /{ADMIN_PATH}/live-visitors     — returns JSON list of active visitors.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECURITY DETAILS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+- app.disable('x-powered-by') — remove Express header fingerprint
+- All admin routes gated by requireAdmin middleware 
+  (checks req.session.adminAuth)
+- Passwords hashed with bcrypt, cost factor 10
+- Session cookie: httpOnly, secure in production, maxAge 8 hours
+- ADMIN_PATH must be 4+ alphanumeric chars. Validated on startup.
+- The admin URL is secret. /admin and /admin/login return 404.
+- GitHub and Railway tokens stored in .local/ with mode 0o600
+- All user-generated content run through an escHtml() function 
+  before insertion into HTML templates
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FILE STRUCTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+index.js              — entire server (all routes, all HTML templates)
+package.json          — dependencies: express, express-session, bcryptjs, pg
+public/
+  index.html          — main public landing page
+  safe.html           — safe page for bots/reviewers
+  offer.html          — offer page for real visitors
+data/                 — JSON fallback files (auto-created)
+  settings.json
+  sites.json
+  logs.json
+  leads.json
+  admin_hash          — bcrypt hash of current admin password
+.local/               — private token storage
+  github_token
+  railway_token
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WHAT TO BUILD FIRST (suggested order)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. index.js skeleton: Express setup, env vars, session middleware, 
+   static serving
+2. Database init: create tables, load caches from DB on startup
+3. Cloaking engine: POST /api/v1/pixel with all 10+ checks
+4. Lead capture: POST /api/v1/event
+5. Admin login page and session auth
+6. Admin dashboard page with KPI cards, charts, and live feed SSE
+7. Sites management section
+8. Click Log section
+9. Leads section
+10. Blocked IPs section
+11. Settings section (all tabs)
+12. Live visitors tracker (SSE + drawer)
+13. GitHub inject function
+14. Railway deploy function
+15. Public landing pages
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+IMPORTANT NOTES FOR THE AGENT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+- Everything in one file (index.js). No separate route files. 
+  No React. No Webpack. No TypeScript.
+- All admin HTML is a large template literal returned from a function 
+  called adminDashboardPage(). The entire admin SPA is one string of HTML 
+  that includes inline CSS and inline JavaScript at the bottom.
+- Use EventEmitter to emit events (newLog, newLead, siteStatus, 
+  statsUpdate, visitorsUpdate) and pipe them to the SSE endpoint.
+- The ip-api.com call has a 5-second timeout. If it fails, use 
+  fallback values (country=XX, empty strings for everything else) 
+  and continue — never fail a visitor request because of an API timeout.
+- When the admin changes a setting, write to both the DB and the JSON 
+  fallback file. Always update the in-memory cache.
+- The admin panel has its own URL that is NOT /admin. It is set via 
+  the ADMIN_PATH environment variable. Make it configurable.
+- Deploy to Railway. Add a PostgreSQL plugin in Railway and it will 
+  auto-set DATABASE_URL.
+- Set ADMIN_PASSWORD, SESSION_SECRET, and ADMIN_PATH as Railway 
+  environment variables.
