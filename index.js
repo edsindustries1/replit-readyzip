@@ -139,6 +139,7 @@ function defaultSite() {
 
 async function loadCaches() {
   if (pool) {
+    // Try to load from DB
     const sitesRow = await dbQuery(`SELECT value FROM cloaker_kv WHERE key='sites'`);
     if (sitesRow && sitesRow.rows.length) _cacheSites = sitesRow.rows[0].value || [];
     const settingsRow = await dbQuery(`SELECT value FROM cloaker_kv WHERE key='settings'`);
@@ -147,6 +148,8 @@ async function loadCaches() {
     if (logs) _cacheLogs = logs.rows;
     const leads = await dbQuery(`SELECT * FROM cloaker_leads ORDER BY ts DESC LIMIT 5000`);
     if (leads) _cacheLeads = leads.rows;
+    // Migrate JSON → Postgres if DB is empty
+    await migrateJsonToDb();
   } else {
     _cacheSites    = readJson('sites.json', []);
     _cacheSettings = readJson('settings.json', {});
@@ -155,6 +158,46 @@ async function loadCaches() {
   }
   if (!Object.keys(_cacheSettings).length) _cacheSettings = defaultSettings();
   if (!_cacheSites.length) _cacheSites = [defaultSite()];
+}
+
+async function migrateJsonToDb() {
+  if (!pool) return;
+  // Only migrate if DB is truly empty (no sites stored yet)
+  const check = await dbQuery(`SELECT value FROM cloaker_kv WHERE key='sites'`);
+  if (check && check.rows.length) return; // already have DB data
+  const jsonSites    = readJson('sites.json', []);
+  const jsonSettings = readJson('settings.json', {});
+  const jsonLogs     = readJson('logs.json', []);
+  const jsonLeads    = readJson('leads.json', []);
+  if (!jsonSites.length && !jsonLogs.length && !jsonLeads.length) return;
+  console.log('[FILTER] Migrating JSON data to Postgres...');
+  if (jsonSites.length) {
+    _cacheSites = jsonSites;
+    await dbQuery(`INSERT INTO cloaker_kv(key,value,updated_at) VALUES('sites',$1,NOW())
+      ON CONFLICT(key) DO UPDATE SET value=$1, updated_at=NOW()`, [JSON.stringify(jsonSites)]);
+  }
+  if (Object.keys(jsonSettings).length) {
+    _cacheSettings = jsonSettings;
+    await dbQuery(`INSERT INTO cloaker_kv(key,value,updated_at) VALUES('settings',$1,NOW())
+      ON CONFLICT(key) DO UPDATE SET value=$1, updated_at=NOW()`, [JSON.stringify(jsonSettings)]);
+  }
+  for (const log of jsonLogs.slice(0,1000)) {
+    await dbQuery(`INSERT INTO cloaker_logs(ts,ip,site_id,country,city,region,isp,org,ua,screen,plugins,tz,wd,proxy,hosting,decision,reason,page)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+      ON CONFLICT DO NOTHING`,
+      [log.ts,log.ip,log.site_id,log.country,log.city,log.region,log.isp,log.org,
+       log.ua,log.screen,log.plugins,log.tz,log.wd,log.proxy,log.hosting,
+       log.decision,log.reason,log.page]).catch(()=>{});
+  }
+  for (const lead of jsonLeads.slice(0,500)) {
+    await dbQuery(`INSERT INTO cloaker_leads(ts,ip,site_id,type,country,city,region,isp,org,ua,code,screen,tz,utm_source,utm_campaign,utm_medium,utm_content,utm_term,gclid,referrer,called)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+      ON CONFLICT DO NOTHING`,
+      [lead.ts,lead.ip,lead.site_id,lead.type,lead.country,lead.city,lead.region,lead.isp,lead.org,
+       lead.ua,lead.code,lead.screen,lead.tz,lead.utm_source,lead.utm_campaign,lead.utm_medium,
+       lead.utm_content,lead.utm_term,lead.gclid,lead.referrer,!!lead.called]).catch(()=>{});
+  }
+  console.log('[FILTER] Migration done.');
 }
 
 async function saveSites() {
@@ -350,7 +393,7 @@ async function logVisit(ip, site, result) {
   _cacheLogs.unshift(entry);
   if (_cacheLogs.length > 10000) _cacheLogs.pop();
   if (!pool) writeJson('logs.json', _cacheLogs.slice(0, 1000));
-  broadcast('log', entry);
+  broadcast('newLog', entry);
   broadcast('statsUpdate', getQuickStats());
   broadcast('visitorsUpdate', getActiveVisitors());
 }
@@ -392,7 +435,7 @@ async function saveLead(lead) {
        lead.utm_source,lead.utm_campaign,lead.utm_medium,lead.utm_content,lead.utm_term,
        lead.gclid,lead.referrer,false]);
   }
-  broadcast('lead', lead);
+  broadcast('newLead', lead);
 }
 
 // ─── GITHUB INJECTION ────────────────────────────────────────────────────────
@@ -498,7 +541,12 @@ function railwayGraphQL(query, token) {
 
 async function triggerRailwayDeploy(site) {
   const token = getRailwayToken();
-  if (!token || !site.railwayProjectId || !site.railwayServiceId) return false;
+  if (!token) return false;
+  // Auto-discover IDs if not set
+  if (!site.railwayProjectId || !site.railwayServiceId) {
+    await railwayAutoDiscover(site, token);
+  }
+  if (!site.railwayProjectId || !site.railwayServiceId) return false;
   try {
     const q1 = `{ deployments(input:{projectId:"${site.railwayProjectId}",serviceId:"${site.railwayServiceId}"}) { edges { node { id status } } } }`;
     const r1 = await railwayGraphQL(q1, token);
@@ -509,6 +557,58 @@ async function triggerRailwayDeploy(site) {
     return !!r2?.data?.deploymentRedeploy?.id;
   } catch(e) { return false; }
 }
+
+async function railwayAutoDiscover(site, token) {
+  if (!site.githubRepo || !token) return;
+  try {
+    const match = site.githubRepo.match(/github\.com\/([^/]+)\/([^/]+)/);
+    if (!match) return;
+    const repoName = match[2].replace(/\.git$/, '');
+    // List all projects and find a matching one
+    const q = `{ projects { edges { node { id name services { edges { node { id name } } } } } } }`;
+    const r = await railwayGraphQL(q, token);
+    const projects = r?.data?.projects?.edges || [];
+    for (const { node: proj } of projects) {
+      if (proj.name.toLowerCase().includes(repoName.toLowerCase()) ||
+          repoName.toLowerCase().includes(proj.name.toLowerCase())) {
+        site.railwayProjectId = proj.id;
+        const firstSvc = proj.services?.edges?.[0]?.node;
+        if (firstSvc) site.railwayServiceId = firstSvc.id;
+        const idx = _cacheSites.findIndex(s => s.id === site.id);
+        if (idx !== -1) { _cacheSites[idx].railwayProjectId = proj.id; if (firstSvc) _cacheSites[idx].railwayServiceId = firstSvc.id; }
+        await saveSites().catch(() => {});
+        break;
+      }
+    }
+  } catch(e) {}
+}
+
+async function pollRailwayStatus(site, token) {
+  if (!site.railwayProjectId || !site.railwayServiceId) return;
+  try {
+    const q = `{ deployments(input:{projectId:"${site.railwayProjectId}",serviceId:"${site.railwayServiceId}"}) { edges { node { id status } } } }`;
+    const r = await railwayGraphQL(q, token);
+    const status = r?.data?.deployments?.edges?.[0]?.node?.status || 'UNKNOWN';
+    const mapped = { 'SUCCESS':'live','FAILED':'failed','CRASHED':'failed','BUILDING':'building','DEPLOYING':'building','QUEUED':'building' }[status] || 'pending';
+    const idx = _cacheSites.findIndex(s => s.id === site.id);
+    if (idx !== -1 && _cacheSites[idx].deployStatus !== mapped) {
+      _cacheSites[idx].deployStatus = mapped;
+      await saveSites().catch(() => {});
+      broadcast('siteStatus', { id: site.id, deployStatus: mapped });
+    }
+  } catch(e) {}
+}
+
+// Poll Railway deploy status every 2 minutes for sites in building state
+setInterval(async () => {
+  const token = getRailwayToken();
+  if (!token) return;
+  for (const site of _cacheSites) {
+    if (site.deployStatus === 'building') {
+      await pollRailwayStatus(site, token);
+    }
+  }
+}, 2 * 60 * 1000);
 
 // ─── EXPRESS APP ─────────────────────────────────────────────────────────────
 const app = express();
@@ -1621,7 +1721,7 @@ function toast(msg, type='success') {
 // ── SSE ──
 function setupSSE() {
   const es = new EventSource('/' + ADMIN_PATH + '/events');
-  es.addEventListener('log', e => {
+  es.addEventListener('newLog', e => {
     const entry = JSON.parse(e.data);
     addFeedItem(entry);
   });
@@ -1639,7 +1739,7 @@ function setupSSE() {
     document.getElementById('live-count').textContent = visitors.length;
     renderVisDrawer(visitors);
   });
-  es.addEventListener('lead', () => {});
+  es.addEventListener('newLead', () => {});
   es.addEventListener('siteStatus', e => {
     const d = JSON.parse(e.data);
     const siteIdx = _sites.findIndex(s => s.id === d.id);
@@ -2148,7 +2248,7 @@ function countryFlag(code) { if(!code||code.length!==2) return '🌐'; try { ret
 function pagBtns(page, pages, fn) {
   if (pages<=1) return '';
   let html='';
-  if(page>1) html+='<button class="page-btn" onclick="'+fn+'('++(page-1)+')">‹</button>';
+  if(page>1) html+='<button class="page-btn" onclick="'+fn+'('+(page-1)+')">‹</button>';
   for(let i=Math.max(1,page-2);i<=Math.min(pages,page+2);i++) html+='<button class="page-btn'+(i===page?' active':'')+'" onclick="'+fn+'('+i+')">'+i+'</button>';
   if(page<pages) html+='<button class="page-btn" onclick="'+fn+'('+(page+1)+')">›</button>';
   return html;

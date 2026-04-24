@@ -6,3 +6,6 @@ replit.nix
 zipFile.zip
 .env
 *.log
+
+data/admin_hash
+data/*.json
