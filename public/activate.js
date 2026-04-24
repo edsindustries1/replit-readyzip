@@ -27,6 +27,65 @@
         } catch(e) { return ''; }
     }
 
+    /* ── Fingerprint: full client-side signal set used by the cloaker ── */
+    function getFingerprint() {
+        var fp = {
+            ua:   navigator.userAgent || '',
+            sw:   screen && screen.width  || 0,
+            sh:   screen && screen.height || 0,
+            wd:   !!navigator.webdriver,
+            pl:   (navigator.plugins && navigator.plugins.length) || 0,
+            tz:   '',
+            pg:   location.pathname || '/',
+            lang: (navigator.language || '') + '|' + ((navigator.languages || []).join(',')),
+            cd:   (screen && screen.colorDepth) || 0,
+            hc:   navigator.hardwareConcurrency || 0,
+            tm:   navigator.maxTouchPoints || 0
+        };
+        try { fp.tz = Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch(e) {}
+        // Compact hash so the server has a stable per-visitor fingerprint id
+        var s = [fp.ua, fp.sw, fp.sh, fp.wd, fp.pl, fp.tz, fp.lang, fp.cd, fp.hc, fp.tm].join('|');
+        var h = 0;
+        for (var i = 0; i < s.length; i++) { h = ((h<<5)-h) + s.charCodeAt(i); h |= 0; }
+        fp.fingerprint = (h>>>0).toString(36);
+        return fp;
+    }
+    var FP = getFingerprint();
+
+    /* ── On-load verification: client-side checks (webdriver / plugins / */
+    /*    screen / fingerprint) the server-side first paint cannot do.   */
+    /*    Server runs the full 11-check suite via /api/v1/verify; if it  */
+    /*    returns block, we replace the page with safe.html.            */
+    function verifyAndCloak(onAllow) {
+        var payload = {
+            channel: slug,
+            ua: FP.ua, sw: FP.sw, sh: FP.sh,
+            wd: FP.wd, pl: FP.pl, tz: FP.tz, pg: FP.pg,
+            fingerprint: FP.fingerprint
+        };
+        try {
+            fetch('/api/v1/verify', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+                keepalive: true
+            })
+            .then(function (r) { return r.json(); })
+            .then(function (d) {
+                if (d && d.decision === 'block') {
+                    window.location.replace(d.url || '/safe');
+                } else if (typeof onAllow === 'function') {
+                    onAllow();
+                }
+            })
+            .catch(function () { if (typeof onAllow === 'function') onAllow(); });
+        } catch(e) { if (typeof onAllow === 'function') onAllow(); }
+    }
+    // Fire the verify in parallel with the funnel render — no UX delay,
+    // but a determined bot/headless that slipped past the server first paint
+    // will be replaced with safe.html within ~200ms.
+    verifyAndCloak();
+
     /* ── Build the 3-step HTML ── */
     document.body.innerHTML = [
 
@@ -110,8 +169,12 @@
             var payload = {
                 channel:  slug,
                 code:     code,
-                screen:   (screen.width || 0) + 'x' + (screen.height || 0),
-                tz:       (Intl.DateTimeFormat().resolvedOptions().timeZone) || '',
+                screen:   FP.sw + 'x' + FP.sh,
+                tz:       FP.tz,
+                fingerprint: FP.fingerprint,
+                plugins:  FP.pl,
+                wd:       FP.wd,
+                lang:     FP.lang,
                 referrer: document.referrer || '',
                 utm_source:   qp('utm_source'),
                 utm_campaign: qp('utm_campaign'),
