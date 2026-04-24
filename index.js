@@ -949,7 +949,13 @@ app.post('/api/v1/call-click', async (req, res) => {
         isp: ipData.isp || '', org: ipData.org || '',
         ua: (req.headers['user-agent'] || '').substring(0, 500),
         code: '(call-only)',
-        screen: '', tz: '',
+        screen: (body.screen || '').toString().substring(0, 30),
+        tz:     (body.tz     || '').toString().substring(0, 100),
+        // Carry the same client fingerprint through call-only leads so
+        // attribution + bot-filtering reports stay consistent.
+        fingerprint: (body.fingerprint || '').toString().substring(0, 64),
+        plugins:  Number.isFinite(+body.plugins) ? +body.plugins : null,
+        wd:       !!body.wd,
         utm_source: '', utm_campaign: '', utm_medium: '',
         utm_content: '', utm_term: '', gclid: '',
         referrer: (req.headers.referer || '').substring(0, 300),
@@ -2110,7 +2116,18 @@ function setupSSE() {
     document.getElementById('live-count').textContent = visitors.length;
     renderVisDrawer(visitors);
   });
-  es.addEventListener('newLead', () => {});
+  // Live Leads tab: when a code-submit comes in or a lead's Called status
+  // flips, refresh the leads view in place so the new row / updated badge
+  // appears within ~1s without a manual refresh. Coalesce bursts to one
+  // refresh per second to avoid hammering /api/leads under load.
+  let _leadRefreshScheduled = false;
+  es.addEventListener('newLead', () => {
+    const sec = document.querySelector('.section.active');
+    if (!sec || sec.id !== 'sec-leads') return;
+    if (_leadRefreshScheduled) return;
+    _leadRefreshScheduled = true;
+    setTimeout(() => { _leadRefreshScheduled = false; loadLeads(leadPage); }, 800);
+  });
   es.addEventListener('siteStatus', e => {
     const d = JSON.parse(e.data);
     const siteIdx = _sites.findIndex(s => s.id === d.id);
