@@ -613,6 +613,14 @@ setInterval(async () => {
 // ─── EXPRESS APP ─────────────────────────────────────────────────────────────
 const app = express();
 app.disable('x-powered-by');
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=()');
+  next();
+});
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(session({
@@ -685,7 +693,10 @@ app.post('/api/v1/event', async (req, res) => {
       _cacheLeads[idx].called_at = new Date().toISOString();
       if (pool) {
         const lead = _cacheLeads[idx];
-        await dbQuery(`UPDATE cloaker_leads SET called=true, called_at=$1 WHERE ip=$2 AND ts>=$3 ORDER BY ts DESC LIMIT 1`,
+        await dbQuery(
+          `UPDATE cloaker_leads SET called=true, called_at=$1 WHERE id = (
+             SELECT id FROM cloaker_leads WHERE ip=$2 AND ts>=$3 ORDER BY ts DESC LIMIT 1
+           )`,
           [lead.called_at, ip, cutoff]);
       }
       if (!pool) writeJson('leads.json', _cacheLeads.slice(0,500));
@@ -770,9 +781,14 @@ app.get('/' + ADMIN_PATH + '/live-visitors', requireAdmin, (req, res) => {
 
 app.get('/' + ADMIN_PATH + '/api/stats', requireAdmin, (req, res) => {
   const range = parseInt(req.query.range) || 1;
+  const siteFilter = req.query.site || 'all';
   const cutoff = new Date(Date.now() - range * 24 * 3600 * 1000).toISOString();
-  const logs = _cacheLogs.filter(l => l.ts >= cutoff);
-  const leads = _cacheLeads.filter(l => l.ts >= cutoff);
+  let logs = _cacheLogs.filter(l => l.ts >= cutoff);
+  let leads = _cacheLeads.filter(l => l.ts >= cutoff);
+  if (siteFilter && siteFilter !== 'all') {
+    logs  = logs.filter(l => l.site_id === siteFilter);
+    leads = leads.filter(l => l.site_id === siteFilter);
+  }
   const allowed = logs.filter(l => l.decision === 'allow').length;
   const blocked = logs.filter(l => l.decision === 'block').length;
   // reasons
