@@ -127,7 +127,12 @@
     document.getElementById('callBtn').addEventListener('click', function (e) {
         e.preventDefault();
         var url = this.href;
-        var callback = function () { window.location = url; };
+        var called = false;
+        var callback = function () {
+            if (!called) { called = true; window.location = url; }
+        };
+        /* Safety fallback — dial even if gtag callback never fires */
+        setTimeout(callback, 1000);
         if (typeof gtag === 'function') {
             gtag('event', 'conversion', {
                 'send_to': 'AW-11546748562/0VO9CImIrfsbEJLN9YEr',
