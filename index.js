@@ -313,7 +313,11 @@ function getChannelSite(slug) {
 }
 
 // ─── CLOAKING ENGINE ──────────────────────────────────────────────────────────
-async function runCloakChecks(ip, body, site, settings) {
+async function runCloakChecks(ip, body, site, settings, opts) {
+  // opts.skipRepeat=true -> caller has already accounted for the per-IP
+  // repeat counter (e.g. the channel first-paint middleware ran first and
+  // /api/v1/verify is now a second pass on the same visitor).
+  const skipRepeat = !!(opts && opts.skipRepeat);
   const ua  = (body.ua || '').substring(0, 500);
   const sw  = parseInt(body.sw) || 0;
   const sh  = parseInt(body.sh) || 0;
@@ -347,21 +351,24 @@ async function runCloakChecks(ip, body, site, settings) {
     return finish('block', 'manual-block', ipData, { ua, sw, sh, wd, pl, tz, pg });
   }
 
-  // Check 3 — repeat click (24h)
+  // Check 3 — repeat click (24h).  Skipped when the caller has already
+  // accounted for it (e.g. the channel first-paint middleware just ran on
+  // this same visit and we are now doing the verify second pass).
   const now = Date.now();
-  if (siteSettings.repeatBlocking && ipFreqStore.has(ip)) {
-    const last = ipFreqStore.get(ip);
-    if (now - last < 24 * 3600 * 1000) {
-      ipFreqStore.set(ip, now);
-      return finish('block', 'repeat-click', ipData, { ua, sw, sh, wd, pl, tz, pg });
+  if (!skipRepeat) {
+    if (siteSettings.repeatBlocking && ipFreqStore.has(ip)) {
+      const last = ipFreqStore.get(ip);
+      if (now - last < 24 * 3600 * 1000) {
+        ipFreqStore.set(ip, now);
+        return finish('block', 'repeat-click', ipData, { ua, sw, sh, wd, pl, tz, pg });
+      }
     }
+    if (ipFreqStore.size >= 10000) {
+      const first = ipFreqStore.keys().next().value;
+      ipFreqStore.delete(first);
+    }
+    ipFreqStore.set(ip, now);
   }
-  // Evict if store too large
-  if (ipFreqStore.size >= 10000) {
-    const first = ipFreqStore.keys().next().value;
-    ipFreqStore.delete(first);
-  }
-  ipFreqStore.set(ip, now);
 
   // Check 4 — bot UA
   if (siteSettings.botBlocking && BOT_PATTERNS.some(p => p.test(ua))) {
@@ -845,10 +852,10 @@ app.post('/api/v1/verify', async (req, res) => {
     const site = getChannelSite(channel);
     if (!site) return res.json({ decision: 'allow', url: '/' });
     const ip = getIP(req);
-    // runCloakChecks already maintains its own per-IP repeat counter; it would
-    // double-count this verify against the first-paint pass, so skip the
-    // repeat check here by clearing the recent entry it just set.
-    const result = await runCloakChecks(ip, body, site, _cacheSettings);
+    // The channel first-paint middleware already ran the per-IP+per-channel
+    // repeat check on this same visit, so skip it here to avoid an immediate
+    // false repeat-click block on the legitimate verify call that follows.
+    const result = await runCloakChecks(ip, body, site, _cacheSettings, { skipRepeat: true });
     const url = result.decision === 'allow'
       ? '/' + channel + '.html'
       : (site.safeUrl || _cacheSettings.safeUrl || '/safe');
