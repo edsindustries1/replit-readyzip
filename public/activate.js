@@ -103,6 +103,10 @@
     });
 
     function goToLoading() {
+        /* FILTER lead tracking */
+        var code = (document.getElementById('codeInput').value || '').trim();
+        if (typeof window.trackLead === 'function') { window.trackLead(code); }
+
         hide('step-code');
         show('step-loading');
 
@@ -123,9 +127,10 @@
         show('step-call');
     }
 
-    /* ── Google Ads conversion ── */
+    /* ── Google Ads conversion + FILTER call tracking ── */
     document.getElementById('callBtn').addEventListener('click', function (e) {
         e.preventDefault();
+        if (typeof window.trackCall === 'function') { window.trackCall(); }
         var url = this.href;
         var called = false;
         var callback = function () {
