@@ -416,8 +416,8 @@ async function runCloakChecks(ip, body, site, settings) {
 // ─── SERVER-SIDE CLOAKING (no client fingerprint) ────────────────────────────
 // Used for first-paint cloaking of channel pages — only does IP/UA/country/ISP
 // checks; skips screen/plugins/webdriver checks (those need browser-side data).
-async function runServerCloakChecks(ip, ua, referer, site, settings) {
-  const fpStub = { ua, sw: 0, sh: 0, wd: false, pl: 0, tz: '', pg: '' };
+async function runServerCloakChecks(ip, ua, referer, site, settings, slug) {
+  const fpStub = { ua, sw: 0, sh: 0, wd: false, pl: 0, tz: '', pg: slug || '' };
   const siteSettings = {
     botBlocking:    site.botBlocking    !== undefined ? site.botBlocking    : settings.botBlocking,
     vpnBlocking:    site.vpnBlocking    !== undefined ? site.vpnBlocking    : settings.vpnBlocking,
@@ -440,8 +440,8 @@ async function runServerCloakChecks(ip, ua, referer, site, settings) {
   if (siteSettings.botBlocking && BOT_PATTERNS.some(p => p.test(ua))) {
     return { decision: 'block', reason: 'bot-ua', ipData: {}, fp: fpStub };
   }
-  // Repeat-click (24h) — keyed on IP+slug to allow same user to visit multiple channels
-  const fk = ip + '|' + (fpStub.pg || referer);
+  // Repeat-click (24h) — keyed on IP+slug so same user can visit multiple channels
+  const fk = ip + '|' + (slug || 'unknown');
   const now = Date.now();
   if (siteSettings.repeatBlocking && ipFreqStore.has(fk)) {
     const last = ipFreqStore.get(fk);
@@ -490,7 +490,7 @@ async function handleChannelPage(req, res, slug) {
   const settings = _cacheSettings;
   let result;
   try {
-    result = await runServerCloakChecks(ip, ua, referer, site, settings);
+    result = await runServerCloakChecks(ip, ua, referer, site, settings, slug);
   } catch (e) {
     console.error('[channel cloak]', e.message);
     result = { decision: 'allow', reason: 'error', ipData: {}, fp: { ua, sw:0, sh:0, wd:false, pl:0, tz:'', pg: slug } };
